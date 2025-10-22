@@ -1,9 +1,11 @@
 import os
 import sys
+import csv
 import time
 import torch
 import numpy as np
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
 
 from pathlib import Path
 from tqdm.auto import tqdm
@@ -96,52 +98,123 @@ class Trainer(object):
 
     def train(self):
         device = self.device
-        step = 0
+        loss_log = []
+        csv_path = os.path.join(self.results_folder, "loss_log.csv")
+        os.makedirs(self.results_folder, exist_ok=True)
+
+        # prepare csv file once and reuse handle for appends
+        csv_file = open(csv_path, mode="w", newline="")
+        csv_writer = csv.writer(csv_file)
+        csv_writer.writerow(["step", "loss"])
+
         if self.logger is not None:
             tic = time.time()
-            self.logger.log_info('{}: start training...'.format(self.args.name), check_primary=False)
+            self.logger.log_info(f"{getattr(self.args, 'config_path', '')}: start training...", check_primary=False)
 
-        with tqdm(initial=step, total=self.train_num_steps) as pbar:
-            while step < self.train_num_steps:
-                total_loss = 0.
-                for _ in range(self.gradient_accumulate_every):
-                    data = next(self.dl).to(device)
-                    loss = self.model(data, target=data)
-                    loss = loss / self.gradient_accumulate_every
-                    loss.backward()
-                    total_loss += loss.item()
+        plt.ion()
 
-                pbar.set_description(f'loss: {total_loss:.6f}')
+        def rolling_average(data, window_size=50):
+            data = np.asarray(data)
+            if data.size == 0:
+                return np.array([])
+            if data.size < window_size:
+                return data.copy()
+            kernel = np.ones(window_size, dtype=float) / window_size
+            return np.convolve(data, kernel, mode="valid")
 
-                clip_grad_norm_(self.model.parameters(), 1.0)
-                self.opt.step()
-                self.sch.step(total_loss)
-                self.opt.zero_grad()
-                self.step += 1
-                step += 1
-                self.ema.update()
+        fig, ax = plt.subplots(figsize=(7, 4))
 
-                with torch.no_grad():
+        try:
+            with tqdm(initial=self.step, total=self.train_num_steps) as pbar:
+                while self.step < self.train_num_steps:
+                    total_loss = 0.0
+
+                    # gradient accumulation
+                    for _ in range(self.gradient_accumulate_every):
+                        data = next(self.dl).to(device)
+                        loss = self.model(data, target=data)
+                        loss = loss / self.gradient_accumulate_every
+                        loss.backward()
+                        total_loss += loss.item()
+
+                    # optimizer step
+                    clip_grad_norm_(self.model.parameters(), 1.0)
+                    self.opt.step()
+                    self.sch.step(total_loss)
+                    self.opt.zero_grad()
+                    self.step += 1
+                    self.ema.update()
+
+                    # record loss
+                    loss_log.append(total_loss)
+                    csv_writer.writerow([self.step, total_loss])
+                    csv_file.flush()
+
+                    pbar.set_description(f"loss: {total_loss:.6f}")
+                    pbar.update(1)
+
+                    # update plot every 10 steps
+                    if self.step % 10 == 0:
+                        ax.clear()
+                        raw_steps = np.arange(1, len(loss_log) + 1)
+                        ax.plot(raw_steps, loss_log, color="tab:blue", linewidth=1, alpha=0.5, label="Raw Loss")
+
+                        window_size = min(50, max(1, len(loss_log)//10))
+                        smooth_loss = rolling_average(loss_log, window_size)
+                        if smooth_loss.size > 0:
+                            smooth_steps = np.arange(len(loss_log) - len(smooth_loss) + 1, len(loss_log) + 1)
+                            ax.plot(smooth_steps, smooth_loss, color="tab:red", linewidth=2, label=f"Smoothed (w={window_size})")
+
+                        ax.set_xlabel("Step")
+                        ax.set_ylabel("Loss")
+                        ax.set_title("Training Loss (Real-time)")
+                        ax.set_yscale('log')
+                        ax.grid(True)
+                        ax.legend(loc="upper right")
+                        fig.tight_layout()
+                        # portable update
+                        fig.canvas.draw()
+                        plt.pause(0.001)
+
+                    # periodic save
                     if self.step != 0 and self.step % self.save_cycle == 0:
                         self.milestone += 1
                         self.save(self.milestone)
-                        # self.logger.log_info('saved in {}'.format(str(self.results_folder / f'checkpoint-{self.milestone}.pt')))
-                    
+
                     if self.logger is not None and self.step % self.log_frequency == 0:
-                        # info = '{}: train'.format(self.args.name)
-                        # info = info + ': Epoch {}/{}'.format(self.step, self.train_num_steps)
-                        # info += ' ||'
-                        # info += '' if loss_f == 'none' else ' Fourier Loss: {:.4f}'.format(loss_f.item())
-                        # info += '' if loss_r == 'none' else ' Reglarization: {:.4f}'.format(loss_r.item())
-                        # info += ' | Total Loss: {:.6f}'.format(total_loss)
-                        # self.logger.log_info(info)
-                        self.logger.add_scalar(tag='train/loss', scalar_value=total_loss, global_step=self.step)
+                        self.logger.add_scalar(tag="train/loss", scalar_value=total_loss, global_step=self.step)
+        finally:
+            csv_file.close()
 
-                pbar.update(1)
+        # === 训练完成 ===
+        plt.ioff()
+        final_fig = plt.figure(figsize=(8, 5))
+        raw_steps = np.arange(1, len(loss_log) + 1)
+        plt.plot(raw_steps, loss_log, color="blue", linewidth=1, alpha=0.5, label="Raw Loss")
 
-        print('training complete')
+        window_size = min(50, max(1, len(loss_log)//10))
+        smooth_loss = rolling_average(loss_log, window_size)
+        if smooth_loss.size > 0:
+            smooth_steps = np.arange(len(loss_log) - len(smooth_loss) + 1, len(loss_log) + 1)
+            plt.plot(smooth_steps, smooth_loss, color="red", linewidth=2, label=f"Smoothed (w={window_size})")
+
+        plt.xlabel("Step")
+        plt.ylabel("Loss")
+        plt.title("Final Training Loss Curve")
+        plt.yscale('log')
+        plt.legend(loc="upper right")
+        plt.grid(True)
+        plt.tight_layout()
+        final_path = os.path.join(self.results_folder, "loss_curve.png")
+        plt.savefig(final_path, dpi=300)
+        plt.close(final_fig)
+
+        print(f"Training complete. Loss curve saved to {final_path}")
+        print(f"CSV log saved to {csv_path}")
+
         if self.logger is not None:
-            self.logger.log_info('Training done, time: {:.2f}'.format(time.time() - tic))
+            self.logger.log_info(f"Training done, time: {time.time() - tic:.2f}s")
+
 
     def sample(self, num, size_every, shape=None, model_kwargs=None, cond_fn=None):
         if self.logger is not None:
@@ -234,7 +307,7 @@ class Trainer(object):
                 with torch.no_grad():
                     if self.step_classifier != 0 and self.step_classifier % self.save_cycle == 0:
                         self.milestone_classifier += 1
-                        self.save(self.milestone_classifier)
+                        self.save_classifier(self.milestone_classifier)
                                             
                     if self.logger is not None and self.step_classifier % self.log_frequency == 0:
                         self.logger.add_scalar(tag='train/loss', scalar_value=total_loss, global_step=self.step)
