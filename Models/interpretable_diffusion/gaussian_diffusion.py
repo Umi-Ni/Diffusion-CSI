@@ -19,21 +19,21 @@ logger = logging.getLogger(__name__)
 def linear_beta_schedule(timesteps: int) -> torch.Tensor:
     """
     线性 beta 调度。
-    返回 dtype=float64 的张量以匹配全链路双精度。
+    返回 dtype=float32 的张量以匹配全链路单精度。
     """
     scale = 1000 / timesteps
     beta_start = scale * 0.0001
     beta_end = scale * 0.02
-    return torch.linspace(beta_start, beta_end, timesteps, dtype=torch.float64)
+    return torch.linspace(beta_start, beta_end, timesteps, dtype=torch.float32)
 
 
 def cosine_beta_schedule(timesteps: int, s: float = 0.008) -> torch.Tensor:
     """
     余弦 beta 调度（https://openreview.net/forum?id=-NEXDKk8gZ）。
-    返回 dtype=float64 的张量以匹配全链路双精度。
+    返回 dtype=float32 的张量以匹配全链路单精度。
     """
     steps = timesteps + 1
-    x = torch.linspace(0, timesteps, steps, dtype=torch.float64)
+    x = torch.linspace(0, timesteps, steps, dtype=torch.float32)
     alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * math.pi * 0.5) ** 2
     alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
     betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
@@ -48,7 +48,7 @@ class Diffusion_TS(nn.Module):
     - B: batch size
     - T: seq_length （时间步）
     - C: feature_size （特征/通道数）
-    - 全链路 dtype 统一为 float64
+    - 全链路 dtype 统一为 float32（减少显存占用）
     """
 
     def __init__(
@@ -92,8 +92,8 @@ class Diffusion_TS(nn.Module):
         **kwargs,
     ):
         """
-        Diffusion-TS 模型初始化。
-        - 统一 dtype 为 float64；
+    Diffusion-TS 模型初始化。
+    - 统一 dtype 为 float32；
         - 支持关闭/启用频域一致性；
         - 引入相关性正则（通道相关 + 时间自相关）。
         """
@@ -105,7 +105,7 @@ class Diffusion_TS(nn.Module):
             use_fft = bool(kwargs.pop('use_ff'))
 
         # ========== 基本配置 ==========
-        self.dtype = torch.float64
+        self.dtype = torch.float32
         self.eta = eta
         self.use_fft = use_fft
         self.seq_length = seq_length
@@ -148,7 +148,7 @@ class Diffusion_TS(nn.Module):
             n_embd=d_model,
             conv_params=[kernel_size, padding_size],
             **kwargs
-        ).to(dtype=self.dtype)
+    ).to(dtype=self.dtype)
 
         # ========== β 调度策略 ==========
         if beta_schedule == 'linear':
@@ -197,7 +197,7 @@ class Diffusion_TS(nn.Module):
         # ========== 调试信息 ==========
         logger.info(
             f"[Diffusion_TS] Initialized: seq_length={seq_length}, feature_size={feature_size}, "
-            f"use_fft={use_fft}, corr_weight={corr_weight}, dtype=float64"
+            f"use_fft={use_fft}, corr_weight={corr_weight}, dtype={self.dtype}"
         )
 
 

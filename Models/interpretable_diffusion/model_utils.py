@@ -265,8 +265,12 @@ class AdaLayerNorm(nn.Module):
         self.layernorm = nn.LayerNorm(n_embd, elementwise_affine=False)
 
     def forward(self, x, timestep, label_emb=None):
-        emb = self.emb(timestep)
+        # 确保与线性层权重 dtype/device 完全一致，避免 matmul dtype 冲突
+        target_dtype = self.linear.weight.dtype
+        target_device = self.linear.weight.device
+        emb = self.emb(timestep).to(dtype=target_dtype, device=target_device)
         if label_emb is not None:
+            label_emb = label_emb.to(dtype=target_dtype, device=target_device)
             emb = emb + label_emb
         emb = self.linear(self.silu(emb)).unsqueeze(1)
         scale, shift = torch.chunk(emb, 2, dim=2)
@@ -283,8 +287,12 @@ class AdaInsNorm(nn.Module):
         self.instancenorm = nn.InstanceNorm1d(n_embd)
 
     def forward(self, x, timestep, label_emb=None):
-        emb = self.emb(timestep)
+        # 确保与线性层权重 dtype/device 完全一致，避免 matmul dtype 冲突
+        target_dtype = self.linear.weight.dtype
+        target_device = self.linear.weight.device
+        emb = self.emb(timestep).to(dtype=target_dtype, device=target_device)
         if label_emb is not None:
+            label_emb = label_emb.to(dtype=target_dtype, device=target_device)
             emb = emb + label_emb
         emb = self.linear(self.silu(emb)).unsqueeze(1)
         scale, shift = torch.chunk(emb, 2, dim=2)

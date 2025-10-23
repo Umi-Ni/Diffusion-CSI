@@ -31,8 +31,8 @@ class TrendBlock(nn.Module):
             nn.Conv1d(in_feat, out_feat, 3, stride=1, padding=1)
         )
 
-        # 使用 float64，前向时再对齐到输入 x 的 dtype/device
-        lin_space = torch.arange(1, out_dim + 1, 1, dtype=torch.float64) / (out_dim + 1)
+        # 使用 float32，前向时再对齐到输入 x 的 dtype/device
+        lin_space = torch.arange(1, out_dim + 1, 1, dtype=torch.float32) / (out_dim + 1)
         self.poly_space = torch.stack([lin_space ** float(p + 1) for p in range(trend_poly)], dim=0)
 
     def forward(self, input):
@@ -144,7 +144,7 @@ class SeasonBlock(nn.Module):
         super(SeasonBlock, self).__init__()
         season_poly = factor * min(season_max_harmonics, int(out_dim // 2))
         self.season = nn.Conv1d(in_channels=in_dim, out_channels=season_poly, kernel_size=1, padding=0)
-        fourier_space = torch.arange(0, out_dim, 1, dtype=torch.float64) / out_dim
+        fourier_space = torch.arange(0, out_dim, 1, dtype=torch.float32) / out_dim
         p1, p2 = (season_poly // 2, season_poly // 2) if season_poly % 2 == 0 \
             else (season_poly // 2, season_poly // 2 + 1)
         s1 = torch.stack([torch.cos(2 * np.pi * p * fourier_space) for p in range(1, p1 + 1)], dim=0)
