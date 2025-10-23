@@ -4,10 +4,74 @@ import numpy as np
 import pandas as pd
 
 from scipy import io
-from sklearn.preprocessing import MinMaxScaler
 from torch.utils.data import Dataset
 from Models.interpretable_diffusion.model_utils import normalize_to_neg_one_to_one, unnormalize_to_zero_to_one
 from Utils.masking_utils import noise_mask
+
+
+class RobustScaler1D:
+    """Robust per-feature scaler for log-amplitude CSI.
+
+    - Fit on training split only, per subcarrier (feature).
+    - Center: median.
+    - Scale: IQR (Q75 - Q25). If IQR is too small, fallback to 1.4826 * MAD; if still too small, fallback to std; else use 1.0.
+    - Supports 2D shape [N, D] and 3D shape [N, T, D].
+    """
+
+    def __init__(self, eps: float = 1e-6):
+        self.eps = eps
+        self.median = None  # [D]
+        self.scale = None   # [D]
+
+    def _ensure_2d(self, x: np.ndarray):
+        if x.ndim == 2:
+            return x, None
+        elif x.ndim == 3:
+            n, t, d = x.shape
+            return x.reshape(n * t, d), (n, t, d)
+        else:
+            raise ValueError(f"Unsupported shape for RobustScaler1D: {x.shape}")
+
+    def fit(self, x: np.ndarray):
+        x2, _ = self._ensure_2d(x)
+        # median
+        med = np.median(x2, axis=0)
+        # IQR
+        q25 = np.percentile(x2, 25.0, axis=0)
+        q75 = np.percentile(x2, 75.0, axis=0)
+        iqr = q75 - q25
+        # MAD (Median Absolute Deviation)
+        mad = np.median(np.abs(x2 - med), axis=0)
+        mad_sigma = 1.4826 * mad
+        # STD fallback
+        std = np.std(x2, axis=0)
+
+        scale = iqr.copy()
+        # Fallbacks where IQR too small
+        too_small = scale < self.eps
+        scale[too_small] = mad_sigma[too_small]
+        too_small = scale < self.eps
+        scale[too_small] = std[too_small]
+        too_small = scale < self.eps
+        scale[too_small] = 1.0
+
+        self.median = med.astype(np.float64)
+        self.scale = scale.astype(np.float64)
+        return self
+
+    def transform(self, x: np.ndarray) -> np.ndarray:
+        x2, shp = self._ensure_2d(x)
+        z = (x2 - self.median) / (self.scale + self.eps)
+        if shp is None:
+            return z
+        return z.reshape(shp)
+
+    def inverse_transform(self, z: np.ndarray) -> np.ndarray:
+        z2, shp = self._ensure_2d(z)
+        x = z2 * (self.scale + self.eps) + self.median
+        if shp is None:
+            return x
+        return x.reshape(shp)
 
 
 class CustomDataset(Dataset):
@@ -35,20 +99,40 @@ class CustomDataset(Dataset):
             assert predict_length is None and missing_ratio is None, 'predict_length and missing_ratio must be None for training period'
         self.name, self.pred_len, self.missing_ratio = name, predict_length, missing_ratio
         self.style, self.distribution, self.mean_mask_length = style, distribution, mean_mask_length
-        self.rawdata, self.scaler = self.read_data(data_root, self.name)
+        # 读取并仅做对数幅度变换（不做MinMax），返回log域数据
+        self.rawdata_log = self.read_data(data_root, self.name)
         self.dir = os.path.join(output_dir, 'samples')
         os.makedirs(self.dir, exist_ok=True)
 
         self.window, self.period = window, period
-        self.len, self.var_num = self.rawdata.shape[0], self.rawdata.shape[-1]
+        self.len, self.var_num = self.rawdata_log.shape[0], self.rawdata_log.shape[-1]
         self.sample_num_total = self.len // self.window
         self.save2npy = save2npy
+        # auto_norm=True 表示在robust标准化后，再进行[-k,k] -> [-1,1]的线性缩放（可逆），以便与下游保持接口一致。
         self.auto_norm = neg_one_to_one
+        self.robust_clip = 3.0  # k：线性缩放范围，常用3~5
 
-        self.data = self.__normalize(self.rawdata)
-        train, inference = self.__getsamples(self.data, proportion, seed)
+        # 先按窗口切分并划分train/test，再基于train拟合RobustScaler（避免数据泄漏）
+        train_raw, test_raw = self.__getsamples_raw(self.rawdata_log, proportion, seed)
+        # 拟合RobustScaler（在log域上）
+        self.scaler = RobustScaler1D().fit(train_raw)
+        # 变换到robust z-score域
+        train_z = self.scaler.transform(train_raw)
+        test_z = self.scaler.transform(test_raw)
+        # 若需要与模型接口保持[-1,1]的范围，可做线性缩放：clip(z, -k, k)/k
+        if self.auto_norm:
+            train_norm = np.clip(train_z, -self.robust_clip, self.robust_clip) / self.robust_clip
+            test_norm = np.clip(test_z, -self.robust_clip, self.robust_clip) / self.robust_clip
+        else:
+            train_norm, test_norm = train_z, test_z
 
-        self.samples = train if period == 'train' else inference
+        # 保存样本（规范为 [num_segments, window, var_num]）
+        self.samples = train_norm if period == 'train' else test_norm
+        # 可选：保存规范化后的数据（便于对照与复现实验）
+        if self.save2npy:
+            if 1 - proportion > 0:
+                np.save(os.path.join(self.dir, f"{self.name}_norm_truth_{self.window}_test.npy"), test_norm)
+            np.save(os.path.join(self.dir, f"{self.name}_norm_truth_{self.window}_train.npy"), train_norm)
         if period == 'test':
             if missing_ratio is not None:
                 self.masking = self.mask_data(seed)
@@ -60,52 +144,64 @@ class CustomDataset(Dataset):
                 raise NotImplementedError()
         self.sample_num = self.samples.shape[0]
 
-    def __getsamples(self, data, proportion, seed):
-        num_segments = data.shape[0] // self.window
-        x = data.reshape(num_segments, self.window, self.var_num)
+    def __getsamples_raw(self, data_log: np.ndarray, proportion, seed):
+        """将log域原始数据按窗口切分->划分train/test。
+        返回：train_raw, test_raw，形状均为 [num_segments, window, var_num]
+        """
+        num_segments = data_log.shape[0] // self.window
+        x = data_log[: num_segments * self.window].reshape(num_segments, self.window, self.var_num)
 
         train_data, test_data = self.divide(x, proportion, seed)
 
+        # 立即保存未标准化的线性幅度ground truth供可视化对比
         if self.save2npy:
             if 1 - proportion > 0:
-                np.save(os.path.join(self.dir, f"{self.name}_ground_truth_{self.window}_test.npy"), self.unnormalize(test_data))
-            np.save(os.path.join(self.dir, f"{self.name}_ground_truth_{self.window}_train.npy"), self.unnormalize(train_data))
-            if self.auto_norm:
-                if 1 - proportion > 0:
-                    np.save(os.path.join(self.dir, f"{self.name}_norm_truth_{self.window}_test.npy"), unnormalize_to_zero_to_one(test_data))
-                np.save(os.path.join(self.dir, f"{self.name}_norm_truth_{self.window}_train.npy"), unnormalize_to_zero_to_one(train_data))
-            else:
-                if 1 - proportion > 0:
-                    np.save(os.path.join(self.dir, f"{self.name}_norm_truth_{self.window}_test.npy"), test_data)
-                np.save(os.path.join(self.dir, f"{self.name}_norm_truth_{self.window}_train.npy"), train_data)
+                np.save(os.path.join(self.dir, f"{self.name}_ground_truth_{self.window}_test.npy"), self.unnormalize_from_log_domain(test_data))
+            np.save(os.path.join(self.dir, f"{self.name}_ground_truth_{self.window}_train.npy"), self.unnormalize_from_log_domain(train_data))
 
         return train_data, test_data
 
     def normalize(self, sq):
+        """对输入做robust标准化（log域->z-score），并可选做[-1,1]缩放。保留兼容性供外部调用。"""
         d = sq.reshape(-1, self.var_num)
         d = self.scaler.transform(d)
         if self.auto_norm:
-            d = normalize_to_neg_one_to_one(d)
+            d = np.clip(d, -self.robust_clip, self.robust_clip) / self.robust_clip
         return d.reshape(-1, self.window, self.var_num)
 
     def unnormalize(self, sq):
+        """从模型域还原到线性幅度域。
+        输入sq形状为 [num_segments, window, var_num]，其值可能在[-1,1]（auto_norm=True）或为robust z-score（auto_norm=False）。
+        """
         d = self.__unnormalize(sq.reshape(-1, self.var_num))
         return d.reshape(-1, self.window, self.var_num)
     
     def __normalize(self, rawdata):
-        # rawdata 此时已为对数幅度 data_log
+        """保持旧接口（未使用）。建议使用 normalize() 并先fit scaler在train上。"""
         data = self.scaler.transform(rawdata)
         if self.auto_norm:
-            data = normalize_to_neg_one_to_one(data)
+            data = np.clip(data, -self.robust_clip, self.robust_clip) / self.robust_clip
         return data
 
     def __unnormalize(self, data):
+        """将模型输出还原为线性幅度。
+        - 若auto_norm=True，先把[-1,1]缩放回[-k,k]的robust z-score域。
+        - 再用RobustScaler逆变换回log域。
+        - 最后exp回到线性幅度域。
+        """
         if self.auto_norm:
-            data = unnormalize_to_zero_to_one(data)
-        # 先逆 MinMax 到对数域，再做 expm1 回到线性幅度域
+            data = np.clip(data, -1.0, 1.0) * self.robust_clip
+        # z-score -> log域
         x_log = self.scaler.inverse_transform(data)
+        # log域 -> 线性幅度
         x = np.expm1(x_log)
         return x
+
+    def unnormalize_from_log_domain(self, data_log_seq):
+        """辅助函数：已在log域的序列（未做标准化），直接exp回线性幅度域。
+        输入/输出形状与 data_log_seq 相同。
+        """
+        return np.expm1(data_log_seq)
     
     @staticmethod
     def divide(data, ratio, seed=2023):
@@ -132,7 +228,7 @@ class CustomDataset(Dataset):
         """Reads a single .csv robustly.
         - 自动检测是否存在 header（如 'sub01,sub02,...'）
         - 删除 pandas 自动产生的 Unnamed 列（通常是保存时带 index 导致）
-        - 返回 (numpy array, fitted MinMaxScaler)
+        - 返回 log1p(幅度) 的 numpy 数组（不做任何基于全数据的缩放，避免数据泄漏）
         """
         # 先用 header=None 读取，检查首行是否为非数值（即可能为列名）
         try:
@@ -188,13 +284,11 @@ class CustomDataset(Dataset):
             print(f"⚠️ 注意: 读取后发现 {nan_count} 个 NaN，可能是 header/格式问题。文件: {filepath}")
 
         data = df.values.astype(np.float64)
-        # 对幅度做对数变换以缓和长尾与乘性噪声，再做归一化
+        # 对幅度做对数变换以缓和长尾与乘性噪声（仅此一步，不做全数据缩放）
         data_log = np.log1p(np.clip(data, a_min=0.0, a_max=None))
-        scaler = MinMaxScaler()
-        scaler = scaler.fit(data_log)
         # 可选：打印诊断信息，便于调试
-        print(f"[read_data] {os.path.basename(filepath)} -> shape: {data.shape}; columns: {df.shape[1]} | using log1p->MinMax")
-        return data_log, scaler
+        print(f"[read_data] {os.path.basename(filepath)} -> shape: {data.shape}; columns: {df.shape[1]} | using log1p only (no global scaler)")
+        return data_log
 
     
     def mask_data(self, seed=2023):
@@ -238,9 +332,6 @@ class fMRIDataset(CustomDataset):
 
     @staticmethod
     def read_data(filepath, name=''):
-        """Reads a single .csv
-        """
+        """Read fMRI dataset; keep as raw array (no global scaler, follow robust pipeline)."""
         data = io.loadmat(filepath + '/sim4.mat')['ts']
-        scaler = MinMaxScaler()
-        scaler = scaler.fit(data)
-        return data, scaler
+        return data.astype(np.float64)

@@ -5,6 +5,7 @@ __pycache__/
 
 # C extensions
 *.so
+*.csv
 
 # Distribution / packaging
 .Python
@@ -165,4 +166,4 @@ cython_debug/
 ./figures
 ./Result
 ./Record
-./Data/dataset
+./Data/datasets
