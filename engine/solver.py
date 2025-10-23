@@ -12,6 +12,7 @@ from tqdm.auto import tqdm
 from ema_pytorch import EMA
 from torch.optim import Adam
 from torch.nn.utils import clip_grad_norm_
+from torch.cuda.amp import autocast, GradScaler
 from Utils.io_utils import instantiate_from_config, get_model_parameters_info
 
 
@@ -51,6 +52,14 @@ class Trainer(object):
         sc_cfg = config['solver']['scheduler']
         sc_cfg['params']['optimizer'] = self.opt
         self.sch = instantiate_from_config(sc_cfg)
+
+        # AMP 配置（可选）
+        amp_cfg = config['solver'].get('amp', {}) if isinstance(config.get('solver', {}), dict) else {}
+        self.amp_enabled = bool(amp_cfg.get('enabled', False)) and (self.device.type == 'cuda')
+        dtype_str = str(amp_cfg.get('dtype', 'fp16')).lower()
+        self.amp_dtype = torch.float16 if dtype_str == 'fp16' else torch.bfloat16
+        # 仅在 fp16 下使用 GradScaler；bf16 通常不需要缩放
+        self.scaler = GradScaler(enabled=self.amp_enabled and self.amp_dtype == torch.float16)
 
         if self.logger is not None:
             self.logger.log_info(str(get_model_parameters_info(self.model)))
@@ -132,16 +141,31 @@ class Trainer(object):
                     # gradient accumulation
                     for _ in range(self.gradient_accumulate_every):
                         data = next(self.dl).to(device)
-                        loss = self.model(data, target=data)
-                        loss = loss / self.gradient_accumulate_every
-                        loss.backward()
-                        total_loss += loss.item()
+                        if self.amp_enabled:
+                            # 使用 torch.cuda.amp.autocast（旧版不支持 device_type 参数）
+                            with autocast(dtype=self.amp_dtype):
+                                loss = self.model(data, target=data)
+                                loss_to_back = loss / self.gradient_accumulate_every
+                            # fp16 下缩放反传；bf16/禁用AMP则走普通路径
+                            self.scaler.scale(loss_to_back).backward()
+                        else:
+                            loss = self.model(data, target=data)
+                            loss_to_back = loss / self.gradient_accumulate_every
+                            loss_to_back.backward()
+                        total_loss += float(loss.detach())
 
                     # optimizer step
-                    clip_grad_norm_(self.model.parameters(), 1.0)
-                    self.opt.step()
+                    if self.amp_enabled:
+                        # 需先unscale再做梯度裁剪
+                        self.scaler.unscale_(self.opt)
+                        clip_grad_norm_(self.model.parameters(), 1.0)
+                        self.scaler.step(self.opt)
+                        self.scaler.update()
+                    else:
+                        clip_grad_norm_(self.model.parameters(), 1.0)
+                        self.opt.step()
                     self.sch.step(total_loss)
-                    self.opt.zero_grad()
+                    self.opt.zero_grad(set_to_none=True)
                     self.step += 1
                     self.ema.update()
 

@@ -87,7 +87,12 @@ class FourierLayer(nn.Module):
         返回: (B, T, D)
         """
         b, t, d = x.shape
-        x_freq = torch.fft.rfft(x, dim=1)
+        orig_dtype = x.dtype
+        # 在 AMP(fp16) 下，cuFFT 对非 2 的幂长度不友好；用 float32 回退以避免报错
+        if x.dtype in (torch.float16,):
+            x_freq = torch.fft.rfft(x.to(torch.float32), dim=1)
+        else:
+            x_freq = torch.fft.rfft(x, dim=1)
 
         if t % 2 == 0:
             x_freq = x_freq[:, self.low_freq:-1]
@@ -100,7 +105,11 @@ class FourierLayer(nn.Module):
         # 频率张量对齐到输入的 dtype/device
         f = repeat(f, 'f -> b f d', b=x_freq.size(0), d=x_freq.size(2)).to(x_freq.device, dtype=x_freq.real.dtype)
         f = rearrange(f[index_tuple], 'b f d -> b f () d').to(x_freq.device)
-        return self.extrapolate(x_freq, f, t)
+        out = self.extrapolate(x_freq, f, t)
+        # 若前面用 float32 回退了 FFT，则在此处将结果还原到原始 dtype
+        if out.dtype != orig_dtype:
+            out = out.to(orig_dtype)
+        return out
 
     def extrapolate(self, x_freq, f, t):
         x_freq = torch.cat([x_freq, x_freq.conj()], dim=1)

@@ -4,7 +4,7 @@ model:
     seq_length: 500
     feature_size: 56
     n_layer_enc: 4
-    n_layer_dec: 6
+    n_layer_dec: 4
     d_model: 128
     timesteps: 500
     sampling_timesteps: 500
@@ -39,6 +39,10 @@ solver:
       warmup: 500 
       verbose: False
 
+  amp:
+    enabled: True
+    dtype: bf16  # Options: 'fp16' or 'bf16'
+
 dataloader:
   train_dataset:
     target: Utils.Data_utils.csi_datasets.CustomDataset
@@ -69,6 +73,6 @@ dataloader:
     step_size: 5.0e-2
     sampling_steps: 250
 
-  batch_size: 32
+  batch_size: 64
   sample_size: 512
   shuffle: True
