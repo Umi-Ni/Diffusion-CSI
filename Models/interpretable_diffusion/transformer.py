@@ -5,7 +5,8 @@ import torch.nn.functional as F
 
 from torch import nn
 from einops import rearrange, reduce, repeat
-from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
+# 注意：为彻底规避第三方实现的索引兼容性问题，这里实现了本地 RoPE 应用，
+# 不再依赖 rotary-embedding-torch 的 apply_rotary_emb。
 from Models.interpretable_diffusion.model_utils import LearnablePositionalEncoding, Conv_MLP,\
                                                        AdaLayerNorm, Transpose, GELU2, series_decomp
 
@@ -132,7 +133,7 @@ class FullAttention(nn.Module):
                  n_head,          # number of attention heads
                  attn_pdrop=0.1,  # attention dropout
                  resid_pdrop=0.1, # residual dropout
-                 use_rope=False,  # 🔹是否启用RoPE位置编码
+                 use_rope=True,  # 🔹是否启用RoPE位置编码
                  max_seq_len=512  # 🔹RoPE最大序列长度（可调）
     ):
         super().__init__()
@@ -150,10 +151,42 @@ class FullAttention(nn.Module):
         self.resid_drop = nn.Dropout(resid_pdrop)
         self.proj = nn.Linear(n_embd, n_embd)
 
-        # 🔹若启用RoPE，初始化旋转位置编码
+        # 🔹RoPE参数与缓存（彻底规避外部库索引问题，使用本地实现）
+        self.head_dim = n_embd // n_head
         if self.use_rope:
-            head_dim = n_embd // n_head
-            self.rotary_emb = RotaryEmbedding(dim=head_dim)
+            assert self.head_dim % 2 == 0, "head_dim must be even for RoPE"
+        self.rope_base = 10000.0
+        self._rope_cache = {}  # key: (T, device, dtype) -> (cos, sin)
+
+    @staticmethod
+    def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+        """Rotate last dimension pairs: (x0, x1, x2, x3, ...) -> (-x1, x0, -x3, x2, ...)."""
+        x1 = x[..., ::2]
+        x2 = x[..., 1::2]
+        # stack along a new last axis of size 2, then reshape back
+        x_rot = torch.stack((-x2, x1), dim=-1)
+        return x_rot.reshape(x.shape)
+
+    def _get_rope_cos_sin(self, T: int, device: torch.device, dtype: torch.dtype):
+        """Build and cache RoPE cos/sin with shape (1, 1, T, head_dim)."""
+        key = (T, device, dtype)
+        if key in self._rope_cache:
+            return self._rope_cache[key]
+
+        half_dim = self.head_dim // 2
+        # use dtype for AMP compatibility; compute directly in current dtype
+        inv_freq = 1.0 / (self.rope_base ** (torch.arange(0, half_dim, device=device, dtype=dtype) / half_dim))
+        t = torch.arange(T, device=device, dtype=dtype)
+        # (T, half_dim)
+        freqs = torch.einsum('t , d -> t d', t, inv_freq)
+        # interleave to full head_dim by repeating each freq twice for even/odd dims
+        cos = torch.cos(freqs).repeat_interleave(2, dim=-1)  # (T, head_dim)
+        sin = torch.sin(freqs).repeat_interleave(2, dim=-1)  # (T, head_dim)
+        # expand to (1, 1, T, head_dim) for broadcasting with (B, nH, T, head_dim)
+        cos = cos.unsqueeze(0).unsqueeze(0)
+        sin = sin.unsqueeze(0).unsqueeze(0)
+        self._rope_cache[key] = (cos, sin)
+        return cos, sin
 
     def forward(self, x, mask=None):
         """
@@ -170,9 +203,9 @@ class FullAttention(nn.Module):
 
         # --- 🔹RoPE旋转位置编码（仅当启用时） ---
         if self.use_rope:
-            pos = torch.arange(T, device=x.device)
-            rotary_pos_emb = self.rotary_emb(pos)
-            q, k = apply_rotary_emb(rotary_pos_emb, q, k)
+            cos, sin = self._get_rope_cos_sin(T, device=x.device, dtype=q.dtype)
+            q = (q * cos) + (self._rotate_half(q) * sin)
+            k = (k * cos) + (self._rotate_half(k) * sin)
 
         # --- 标准点乘注意力 ---
         att = (q @ k.transpose(-2, -1)) / math.sqrt(k.size(-1))  # (B, nh, T, T)

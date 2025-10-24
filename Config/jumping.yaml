@@ -4,7 +4,7 @@ model:
     seq_length: 500
     feature_size: 56
     n_layer_enc: 4
-    n_layer_dec: 4
+    n_layer_dec: 6
     d_model: 128
     timesteps: 500
     sampling_timesteps: 500
@@ -38,10 +38,6 @@ solver:
       warmup_lr: 5.0e-4
       warmup: 500 
       verbose: False
-
-  amp:
-    enabled: True
-    dtype: bf16  # Options: 'fp16' or 'bf16'
 
 dataloader:
   train_dataset:
