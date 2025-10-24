@@ -12,7 +12,8 @@ from tqdm.auto import tqdm
 from ema_pytorch import EMA
 from torch.optim import Adam
 from torch.nn.utils import clip_grad_norm_
-from IPython.display import clear_output
+from IPython.display import clear_output, display
+from torch.cuda.amp import autocast, GradScaler
 from Utils.io_utils import instantiate_from_config, get_model_parameters_info
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../'))
@@ -37,6 +38,9 @@ class Trainer(object):
         self.milestone = 0
         self.args, self.config = args, config
         self.logger = logger
+        # AMP (fp16) enable only on CUDA
+        self.amp_enabled = (self.model.betas.device.type == 'cuda')
+        self.scaler = GradScaler(enabled=self.amp_enabled)
 
         self.results_folder = Path(config['solver']['results_folder'] + f'_{model.seq_length}')
         os.makedirs(self.results_folder, exist_ok=True)
@@ -133,14 +137,23 @@ class Trainer(object):
                 # === 梯度累积 ===
                 for _ in range(self.gradient_accumulate_every):
                     data = next(self.dl).to(device)
-                    loss = self.model(data, target=data)
-                    loss = loss / self.gradient_accumulate_every
-                    loss.backward()
+                    # 使用 AMP 进行前向与反向
+                    with autocast(enabled=self.amp_enabled, dtype=torch.float16):
+                        loss = self.model(data, target=data)
+                        loss = loss / self.gradient_accumulate_every
+
+                    # 先缩放再反传，防止梯度下溢
+                    self.scaler.scale(loss).backward()
                     total_loss += loss.item()
 
                 # === 优化器更新 ===
+                # 反缩放后再做梯度裁剪
+                self.scaler.unscale_(self.opt)
                 clip_grad_norm_(self.model.parameters(), 1.0)
-                self.opt.step()
+
+                # AMP 更新优化器与 scaler
+                self.scaler.step(self.opt)
+                self.scaler.update()
                 self.sch.step(total_loss)
                 self.opt.zero_grad()
                 self.step += 1
@@ -287,6 +300,7 @@ class Trainer(object):
 
         self.classifier = classifier
         self.opt_classifier = Adam(filter(lambda p: p.requires_grad, self.classifier.parameters()), lr=5.0e-4)
+        scaler_cls = GradScaler(enabled=self.amp_enabled)
         
         if self.logger is not None:
             tic = time.time()
@@ -299,15 +313,19 @@ class Trainer(object):
                     x, y = next(dataloader)
                     x, y = x.to(device), y.to(device)
                     x_t, t = self.forward_sample(x)
-                    logits = classifier(x_t, t)
-                    loss = F.cross_entropy(logits, y)
-                    loss = loss / self.gradient_accumulate_every
-                    loss.backward()
+                    with autocast(enabled=self.amp_enabled, dtype=torch.float16):
+                        logits = classifier(x_t, t)
+                        loss = F.cross_entropy(logits, y)
+                        loss = loss / self.gradient_accumulate_every
+                    scaler_cls.scale(loss).backward()
                     total_loss += loss.item()
 
                 pbar.set_description(f'loss: {total_loss:.6f}')
 
-                self.opt_classifier.step()
+                scaler_cls.unscale_(self.opt_classifier)
+                clip_grad_norm_(self.classifier.parameters(), 1.0)
+                scaler_cls.step(self.opt_classifier)
+                scaler_cls.update()
                 self.opt_classifier.zero_grad()
                 self.step_classifier += 1
                 step += 1

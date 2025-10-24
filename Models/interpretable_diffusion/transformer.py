@@ -63,7 +63,11 @@ class FourierLayer(nn.Module):
     def forward(self, x):
         """x: (b, t, d)"""
         b, t, d = x.shape
-        x_freq = torch.fft.rfft(x, dim=1)
+        # AMP 注意：cuFFT 在 fp16 下仅支持 2 的幂长度。为避免报错，强制在 fp32 下执行 FFT。
+        # 之后再把结果投回到输入 dtype，以保持与混合精度兼容。
+        from torch.cuda.amp import autocast
+        with autocast(enabled=False):
+            x_freq = torch.fft.rfft(x.float(), dim=1)
 
         if t % 2 == 0:
             x_freq = x_freq[:, self.low_freq:-1]
@@ -75,7 +79,8 @@ class FourierLayer(nn.Module):
         x_freq, index_tuple = self.topk_freq(x_freq)
         f = repeat(f, 'f -> b f d', b=x_freq.size(0), d=x_freq.size(2)).to(x_freq.device)
         f = rearrange(f[index_tuple], 'b f d -> b f () d').to(x_freq.device)
-        return self.extrapolate(x_freq, f, t)
+        out = self.extrapolate(x_freq, f, t)
+        return out.to(x.dtype)
 
     def extrapolate(self, x_freq, f, t):
         x_freq = torch.cat([x_freq, x_freq.conj()], dim=1)

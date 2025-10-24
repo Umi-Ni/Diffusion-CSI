@@ -277,8 +277,11 @@ class Diffusion_TS(nn.Module):
         # fourier loss 部分保持可选（你已经决定不使用 fft，对应 use_ff=False）
         fourier_loss = torch.tensor([0.], device=train_loss.device)
         if self.use_ff:
-            fft1 = torch.fft.fft(model_out.transpose(1, 2), norm='forward')
-            fft2 = torch.fft.fft(target.transpose(1, 2), norm='forward')
+            # AMP 注意：避免在 fp16 下对非 2 的幂长度执行 FFT
+            from torch.cuda.amp import autocast
+            with autocast(enabled=False):
+                fft1 = torch.fft.fft(model_out.transpose(1, 2).float(), norm='forward')
+                fft2 = torch.fft.fft(target.transpose(1, 2).float(), norm='forward')
             fft1, fft2 = fft1.transpose(1, 2), fft2.transpose(1, 2)
             fourier_loss = self.loss_fn(torch.real(fft1), torch.real(fft2), reduction='none')\
                            + self.loss_fn(torch.imag(fft1), torch.imag(fft2), reduction='none')
