@@ -12,18 +12,11 @@ from Models.interpretable_diffusion.model_utils import LearnablePositionalEncodi
 
 class TrendBlock(nn.Module):
     """
-    使用多项式基回归拟合时间序列的趋势项。
-
-    参数：
-    - in_dim(int): 输入通道数（通常对应时间步 T，作为 Conv1d 的 in_channels）。
-    - out_dim(int): 输出通道数（通常与 in_dim 相同）。
-    - in_feat(int): 输入特征维度（embedding 维）。
-    - out_feat(int): 输出特征维度。
-    - act(nn.Module): 激活函数。
-    - trend_poly(int): 多项式阶数（默认3）。经验值，足以拟合平滑趋势，过高易过拟合。
+    Model trend of time series using the polynomial regressor.
     """
-    def __init__(self, in_dim, out_dim, in_feat, out_feat, act, trend_poly: int = 3):
+    def __init__(self, in_dim, out_dim, in_feat, out_feat, act):
         super(TrendBlock, self).__init__()
+        trend_poly = 3
         self.trend = nn.Sequential(
             nn.Conv1d(in_channels=in_dim, out_channels=trend_poly, kernel_size=3, padding=1),
             act,
@@ -31,20 +24,13 @@ class TrendBlock(nn.Module):
             nn.Conv1d(in_feat, out_feat, 3, stride=1, padding=1)
         )
 
-        # 使用 float32，前向时再对齐到输入 x 的 dtype/device
-        lin_space = torch.arange(1, out_dim + 1, 1, dtype=torch.float32) / (out_dim + 1)
+        lin_space = torch.arange(1, out_dim + 1, 1) / (out_dim + 1)
         self.poly_space = torch.stack([lin_space ** float(p + 1) for p in range(trend_poly)], dim=0)
 
     def forward(self, input):
-        """
-        输入/输出形状：
-        - input: (B, C, H) 其中 C=时间步数 T，H=embedding 维
-        - 返回: (B, C, H)
-        """
-        b, c, h = input.shape  # (B, C=T, H)
+        b, c, h = input.shape
         x = self.trend(input).transpose(1, 2)
-        # 将多项式基对齐到输入的 dtype/device
-        trend_vals = torch.matmul(x.transpose(1, 2), self.poly_space.to(x.device, dtype=x.dtype))
+        trend_vals = torch.matmul(x.transpose(1, 2), self.poly_space.to(x.device))
         trend_vals = trend_vals.transpose(1, 2)
         return trend_vals
     
@@ -66,33 +52,18 @@ class MovingBlock(nn.Module):
 
 class FourierLayer(nn.Module):
     """
-    使用逆 DFT 思想建模时间序列的季节性（选取能量最高的若干频率分量）。
-
-    参数：
-    - d_model(int): embedding 维度。
-    - low_freq(int): 忽略最低的若干频率（默认1），用于去除直流与超低频噪声的经验值。
-    - factor(float): 选频比例系数，top_k = max(1, int(factor * log(T)))。
-    - topk_min(int): 选频的最小个数下限（默认1）。
+    Model seasonality of time series using the inverse DFT.
     """
-    def __init__(self, d_model, low_freq=1, factor=1, topk_min: int = 1):
+    def __init__(self, d_model, low_freq=1, factor=1):
         super().__init__()
         self.d_model = d_model
         self.factor = factor
         self.low_freq = low_freq
-        self.topk_min = topk_min
 
     def forward(self, x):
-        """
-        x: (B, T, D)
-        返回: (B, T, D)
-        """
+        """x: (b, t, d)"""
         b, t, d = x.shape
-        orig_dtype = x.dtype
-        # 在 AMP(fp16) 下，cuFFT 对非 2 的幂长度不友好；用 float32 回退以避免报错
-        if x.dtype in (torch.float16,):
-            x_freq = torch.fft.rfft(x.to(torch.float32), dim=1)
-        else:
-            x_freq = torch.fft.rfft(x, dim=1)
+        x_freq = torch.fft.rfft(x, dim=1)
 
         if t % 2 == 0:
             x_freq = x_freq[:, self.low_freq:-1]
@@ -102,21 +73,15 @@ class FourierLayer(nn.Module):
             f = torch.fft.rfftfreq(t)[self.low_freq:]
 
         x_freq, index_tuple = self.topk_freq(x_freq)
-        # 频率张量对齐到输入的 dtype/device
-        f = repeat(f, 'f -> b f d', b=x_freq.size(0), d=x_freq.size(2)).to(x_freq.device, dtype=x_freq.real.dtype)
+        f = repeat(f, 'f -> b f d', b=x_freq.size(0), d=x_freq.size(2)).to(x_freq.device)
         f = rearrange(f[index_tuple], 'b f d -> b f () d').to(x_freq.device)
-        out = self.extrapolate(x_freq, f, t)
-        # 若前面用 float32 回退了 FFT，则在此处将结果还原到原始 dtype
-        if out.dtype != orig_dtype:
-            out = out.to(orig_dtype)
-        return out
+        return self.extrapolate(x_freq, f, t)
 
     def extrapolate(self, x_freq, f, t):
         x_freq = torch.cat([x_freq, x_freq.conj()], dim=1)
         f = torch.cat([f, -f], dim=1)
-        # 使用与 x_freq.real 相同的 dtype/device 生成时间索引
-        t = rearrange(torch.arange(t, dtype=x_freq.real.dtype, device=x_freq.device),
-                      't -> () () t ()')
+        t = rearrange(torch.arange(t, dtype=torch.float),
+                      't -> () () t ()').to(x_freq.device)
 
         amp = rearrange(x_freq.abs(), 'b f d -> b f () d')
         phase = rearrange(x_freq.angle(), 'b f d -> b f () d')
@@ -124,14 +89,8 @@ class FourierLayer(nn.Module):
         return reduce(x_time, 'b f t d -> b t d', 'sum')
 
     def topk_freq(self, x_freq):
-        """
-        选取能量最高的 top-k 个频率分量。
-        - x_freq: (B, F, D) 复数张量
-        - 返回: (x_freq_selected, index_tuple)
-        说明：top_k = max(topk_min, int(factor * log(max(length, 2))))
-        """
         length = x_freq.shape[1]
-        top_k = max(self.topk_min, int(self.factor * math.log(max(length, 2))))
+        top_k = int(self.factor * math.log(length))
         values, indices = torch.topk(x_freq.abs(), top_k, dim=1, largest=True, sorted=True)
         mesh_a, mesh_b = torch.meshgrid(torch.arange(x_freq.size(0)), torch.arange(x_freq.size(2)), indexing='ij')
         index_tuple = (mesh_a.unsqueeze(1), indices, mesh_b.unsqueeze(1))
@@ -141,19 +100,13 @@ class FourierLayer(nn.Module):
 
 class SeasonBlock(nn.Module):
     """
-    使用有限项傅里叶级数拟合季节性。
-
-    参数：
-    - in_dim(int): 输入通道数（时间步 T）。
-    - out_dim(int): 输出通道数。
-    - factor(int): 每个基的倍数因子，控制多项式/谐波数量。
-    - season_max_harmonics(int): 谐波数上限（默认32）。经验值，避免过多谐波导致过拟合。
+    Model seasonality of time series using the Fourier series.
     """
-    def __init__(self, in_dim, out_dim, factor=1, season_max_harmonics: int = 32):
+    def __init__(self, in_dim, out_dim, factor=1):
         super(SeasonBlock, self).__init__()
-        season_poly = factor * min(season_max_harmonics, int(out_dim // 2))
+        season_poly = factor * min(32, int(out_dim // 2))
         self.season = nn.Conv1d(in_channels=in_dim, out_channels=season_poly, kernel_size=1, padding=0)
-        fourier_space = torch.arange(0, out_dim, 1, dtype=torch.float32) / out_dim
+        fourier_space = torch.arange(0, out_dim, 1) / out_dim
         p1, p2 = (season_poly // 2, season_poly // 2) if season_poly % 2 == 0 \
             else (season_poly // 2, season_poly // 2 + 1)
         s1 = torch.stack([torch.cos(2 * np.pi * p * fourier_space) for p in range(1, p1 + 1)], dim=0)
@@ -163,7 +116,7 @@ class SeasonBlock(nn.Module):
     def forward(self, input):
         b, c, h = input.shape
         x = self.season(input)
-        season_vals = torch.matmul(x.transpose(1, 2), self.poly_space.to(x.device, dtype=x.dtype))
+        season_vals = torch.matmul(x.transpose(1, 2), self.poly_space.to(x.device))
         season_vals = season_vals.transpose(1, 2)
         return season_vals
 
@@ -213,7 +166,7 @@ class FullAttention(nn.Module):
         # --- 🔹RoPE旋转位置编码（仅当启用时） ---
         if self.use_rope:
             pos = torch.arange(T, device=x.device)
-            rotary_pos_emb = self.rotary_emb(pos).to(x.dtype)
+            rotary_pos_emb = self.rotary_emb(pos)
             q, k = apply_rotary_emb(rotary_pos_emb, q, k)
 
         # --- 标准点乘注意力 ---
@@ -238,7 +191,7 @@ class FullAttention(nn.Module):
             elif T_mask > T_att:
                 # 若mask长于序列，裁剪
                 mask = mask[..., :T_att]
-            att = att.masked_fill(mask == 0, torch.finfo(att.dtype).min)
+            att = att.masked_fill(mask == 0, float('-inf'))
 
 
         att = F.softmax(att, dim=-1)
@@ -473,8 +426,8 @@ class Decoder(nn.Module):
         b, c, _ = x.shape
         # att_weights = []
         mean = []
-        season = torch.zeros((b, c, self.d_model), device=x.device, dtype=x.dtype)
-        trend = torch.zeros((b, c, self.n_feat), device=x.device, dtype=x.dtype)
+        season = torch.zeros((b, c, self.d_model), device=x.device)
+        trend = torch.zeros((b, c, self.n_feat), device=x.device)
         for block_idx in range(len(self.blocks)):
             x, residual_mean, residual_trend, residual_season = \
                 self.blocks[block_idx](x, enc, t, mask=padding_masks, label_emb=label_emb)
@@ -528,12 +481,6 @@ class Transformer(nn.Module):
         self.pos_dec = LearnablePositionalEncoding(n_embd, dropout=resid_pdrop, max_len=max_len)
 
     def forward(self, input, t, padding_masks=None, return_res=False):
-        """
-        主前向：编码-解码-重构，输出趋势与季节误差。
-        - input: (B, T, C)
-        - t: (B,)
-        - 返回: (trend: (B, T, C), season_error: (B, T, C))
-        """
         emb = self.emb(input)
         inp_enc = self.pos_enc(emb)
         enc_cond = self.encoder(inp_enc, t, padding_masks=padding_masks)

@@ -12,9 +12,8 @@ from tqdm.auto import tqdm
 from ema_pytorch import EMA
 from torch.optim import Adam
 from torch.nn.utils import clip_grad_norm_
-from torch.cuda.amp import autocast, GradScaler
+from IPython.display import clear_output
 from Utils.io_utils import instantiate_from_config, get_model_parameters_info
-
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../'))
 
@@ -52,14 +51,6 @@ class Trainer(object):
         sc_cfg = config['solver']['scheduler']
         sc_cfg['params']['optimizer'] = self.opt
         self.sch = instantiate_from_config(sc_cfg)
-
-        # AMP 配置（可选）
-        amp_cfg = config['solver'].get('amp', {}) if isinstance(config.get('solver', {}), dict) else {}
-        self.amp_enabled = bool(amp_cfg.get('enabled', False)) and (self.device.type == 'cuda')
-        dtype_str = str(amp_cfg.get('dtype', 'fp16')).lower()
-        self.amp_dtype = torch.float16 if dtype_str == 'fp16' else torch.bfloat16
-        # 仅在 fp16 下使用 GradScaler；bf16 通常不需要缩放
-        self.scaler = GradScaler(enabled=self.amp_enabled and self.amp_dtype == torch.float16)
 
         if self.logger is not None:
             self.logger.log_info(str(get_model_parameters_info(self.model)))
@@ -107,125 +98,118 @@ class Trainer(object):
 
     def train(self):
         device = self.device
-        loss_log = []
+        step = 0
+        loss_log = []  # 保存loss记录
         csv_path = os.path.join(self.results_folder, "loss_log.csv")
         os.makedirs(self.results_folder, exist_ok=True)
 
-        # prepare csv file once and reuse handle for appends
-        csv_file = open(csv_path, mode="w", newline="")
-        csv_writer = csv.writer(csv_file)
-        csv_writer.writerow(["step", "loss"])
+        # 初始化CSV文件
+        with open(csv_path, mode="w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["step", "loss"])
 
         if self.logger is not None:
             tic = time.time()
-            self.logger.log_info(f"{getattr(self.args, 'config_path', '')}: start training...", check_primary=False)
+            self.logger.log_info(f"{self.args.config_path}: start training...", check_primary=False)
 
-        plt.ion()
+        plt.ion()  # 开启交互式绘图模式（Notebook 实时刷新）
 
+        # 定义滚动平均函数
         def rolling_average(data, window_size=50):
-            data = np.asarray(data)
-            if data.size == 0:
-                return np.array([])
-            if data.size < window_size:
-                return data.copy()
-            kernel = np.ones(window_size, dtype=float) / window_size
-            return np.convolve(data, kernel, mode="valid")
+            data = np.array(data)
+            if len(data) < window_size:
+                return data  # 如果数据太短，直接返回原始
+            return np.convolve(data, np.ones(window_size) / window_size, mode='valid')
 
+        # 创建固定figure用于实时更新
         fig, ax = plt.subplots(figsize=(7, 4))
+        plot_display = display(fig, display_id=True)
+        plt.close(fig)  # 初始关闭，避免多余显示
 
-        try:
-            with tqdm(initial=self.step, total=self.train_num_steps) as pbar:
-                while self.step < self.train_num_steps:
-                    total_loss = 0.0
+        with tqdm(initial=step, total=self.train_num_steps) as pbar:
+            while step < self.train_num_steps:
+                total_loss = 0.0
 
-                    # gradient accumulation
-                    for _ in range(self.gradient_accumulate_every):
-                        data = next(self.dl).to(device)
-                        if self.amp_enabled:
-                            # 使用 torch.cuda.amp.autocast（旧版不支持 device_type 参数）
-                            with autocast(dtype=self.amp_dtype):
-                                loss = self.model(data, target=data)
-                                loss_to_back = loss / self.gradient_accumulate_every
-                            # fp16 下缩放反传；bf16/禁用AMP则走普通路径
-                            self.scaler.scale(loss_to_back).backward()
-                        else:
-                            loss = self.model(data, target=data)
-                            loss_to_back = loss / self.gradient_accumulate_every
-                            loss_to_back.backward()
-                        total_loss += float(loss.detach())
+                # === 梯度累积 ===
+                for _ in range(self.gradient_accumulate_every):
+                    data = next(self.dl).to(device)
+                    loss = self.model(data, target=data)
+                    loss = loss / self.gradient_accumulate_every
+                    loss.backward()
+                    total_loss += loss.item()
 
-                    # optimizer step
-                    if self.amp_enabled:
-                        # 需先unscale再做梯度裁剪
-                        self.scaler.unscale_(self.opt)
-                        clip_grad_norm_(self.model.parameters(), 1.0)
-                        self.scaler.step(self.opt)
-                        self.scaler.update()
-                    else:
-                        clip_grad_norm_(self.model.parameters(), 1.0)
-                        self.opt.step()
-                    self.sch.step(total_loss)
-                    self.opt.zero_grad(set_to_none=True)
-                    self.step += 1
-                    self.ema.update()
+                # === 优化器更新 ===
+                clip_grad_norm_(self.model.parameters(), 1.0)
+                self.opt.step()
+                self.sch.step(total_loss)
+                self.opt.zero_grad()
+                self.step += 1
+                step += 1
+                self.ema.update()
 
-                    # record loss
-                    loss_log.append(total_loss)
-                    csv_writer.writerow([self.step, total_loss])
-                    csv_file.flush()
+                # === 记录loss ===
+                loss_log.append(total_loss)
+                with open(csv_path, mode="a", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow([step, total_loss])
 
-                    pbar.set_description(f"loss: {total_loss:.6f}")
-                    pbar.update(1)
+                # === tqdm显示 ===
+                pbar.set_description(f"loss: {total_loss:.6f}")
+                pbar.update(1)
 
-                    # update plot every 10 steps
-                    if self.step % 10 == 0:
-                        ax.clear()
-                        raw_steps = np.arange(1, len(loss_log) + 1)
-                        ax.plot(raw_steps, loss_log, color="tab:blue", linewidth=1, alpha=0.5, label="Raw Loss")
+                # === 实时绘图（每10步刷新一次）===
+                if step % 10 == 0:
+                    ax.clear()
+                    
+                    # 原始损失曲线（浅色、细线、半透明）
+                    raw_steps = np.arange(1, len(loss_log) + 1)
+                    ax.plot(raw_steps, loss_log, color="tab:blue", linewidth=1, alpha=0.5, label="Raw Loss")
+                    
+                    # 平滑损失曲线（深色、粗线）
+                    window_size = 50  # 可调整，例如根据总步数动态设置，如 min(50, len(loss_log)//10)
+                    smooth_loss = rolling_average(loss_log, window_size)
+                    if len(smooth_loss) > 0:
+                        smooth_steps = np.arange(len(loss_log) - len(smooth_loss) + 1, len(loss_log) + 1)
+                        ax.plot(smooth_steps, smooth_loss, color="tab:red", linewidth=2, label="Smoothed Loss (window=50)")
+                    
+                    ax.set_xlabel("Step")
+                    ax.set_ylabel("Loss")
+                    ax.set_title("Training Loss (Real-time)")
+                    ax.set_yscale('log')  # 新增：设置 y 轴为对数尺度
+                    ax.grid(True)
+                    ax.legend(loc="upper right")  # 添加图例
+                    fig.tight_layout()
+                    
+                    plot_display.update(fig)
 
-                        window_size = min(50, max(1, len(loss_log)//10))
-                        smooth_loss = rolling_average(loss_log, window_size)
-                        if smooth_loss.size > 0:
-                            smooth_steps = np.arange(len(loss_log) - len(smooth_loss) + 1, len(loss_log) + 1)
-                            ax.plot(smooth_steps, smooth_loss, color="tab:red", linewidth=2, label=f"Smoothed (w={window_size})")
+                # === 定期保存模型 ===
+                if self.step != 0 and self.step % self.save_cycle == 0:
+                    self.milestone += 1
+                    self.save(self.milestone)
 
-                        ax.set_xlabel("Step")
-                        ax.set_ylabel("Loss")
-                        ax.set_title("Training Loss (Real-time)")
-                        ax.set_yscale('log')
-                        ax.grid(True)
-                        ax.legend(loc="upper right")
-                        fig.tight_layout()
-                        # portable update
-                        fig.canvas.draw()
-                        plt.pause(0.001)
-
-                    # periodic save
-                    if self.step != 0 and self.step % self.save_cycle == 0:
-                        self.milestone += 1
-                        self.save(self.milestone)
-
-                    if self.logger is not None and self.step % self.log_frequency == 0:
-                        self.logger.add_scalar(tag="train/loss", scalar_value=total_loss, global_step=self.step)
-        finally:
-            csv_file.close()
+                # === 记录日志 ===
+                if self.logger is not None and self.step % self.log_frequency == 0:
+                    self.logger.add_scalar(tag="train/loss", scalar_value=total_loss, global_step=self.step)
 
         # === 训练完成 ===
         plt.ioff()
         final_fig = plt.figure(figsize=(8, 5))
+        
+        # 原始损失曲线
         raw_steps = np.arange(1, len(loss_log) + 1)
         plt.plot(raw_steps, loss_log, color="blue", linewidth=1, alpha=0.5, label="Raw Loss")
-
-        window_size = min(50, max(1, len(loss_log)//10))
+        
+        # 平滑损失曲线
+        window_size = 50  # 与实时一致
         smooth_loss = rolling_average(loss_log, window_size)
-        if smooth_loss.size > 0:
+        if len(smooth_loss) > 0:
             smooth_steps = np.arange(len(loss_log) - len(smooth_loss) + 1, len(loss_log) + 1)
-            plt.plot(smooth_steps, smooth_loss, color="red", linewidth=2, label=f"Smoothed (w={window_size})")
-
+            plt.plot(smooth_steps, smooth_loss, color="red", linewidth=2, label="Smoothed Loss (window=50)")
+        
         plt.xlabel("Step")
         plt.ylabel("Loss")
         plt.title("Final Training Loss Curve")
-        plt.yscale('log')
+        plt.yscale('log')  # 新增：设置 y 轴为对数尺度
         plt.legend(loc="upper right")
         plt.grid(True)
         plt.tight_layout()
@@ -233,8 +217,8 @@ class Trainer(object):
         plt.savefig(final_path, dpi=300)
         plt.close(final_fig)
 
-        print(f"Training complete. Loss curve saved to {final_path}")
-        print(f"CSV log saved to {csv_path}")
+        print(f"✅ Training complete! Loss curve saved to {final_path}")
+        print(f"✅ CSV log saved to {csv_path}")
 
         if self.logger is not None:
             self.logger.log_info(f"Training done, time: {time.time() - tic:.2f}s")
@@ -331,7 +315,7 @@ class Trainer(object):
                 with torch.no_grad():
                     if self.step_classifier != 0 and self.step_classifier % self.save_cycle == 0:
                         self.milestone_classifier += 1
-                        self.save_classifier(self.milestone_classifier)
+                        self.save_classfier(self.milestone_classifier)
                                             
                     if self.logger is not None and self.step_classifier % self.log_frequency == 0:
                         self.logger.add_scalar(tag='train/loss', scalar_value=total_loss, global_step=self.step)
