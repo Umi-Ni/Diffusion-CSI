@@ -2,6 +2,9 @@ import os
 import sys
 import csv
 import time
+import math
+from typing import Any, Dict, Optional, Tuple, List
+
 import torch
 import numpy as np
 import torch.nn.functional as F
@@ -12,20 +15,36 @@ from tqdm.auto import tqdm
 from ema_pytorch import EMA
 from torch.optim import Adam
 from torch.nn.utils import clip_grad_norm_
-from IPython.display import clear_output, display
+# 注：IPython.display 仅在 Notebook 环境下可用；在 train() 内按需动态导入
 from torch.cuda.amp import autocast, GradScaler
 from Utils.io_utils import instantiate_from_config, get_model_parameters_info
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../'))
 
 def cycle(dl):
+    """无限循环数据加载器。
+
+    参数:
+        dl: 可迭代的数据加载器
+    产出:
+        data: 与原始 dl 相同的批数据
+    """
     while True:
         for data in dl:
             yield data
 
 
 class Trainer(object):
-    def __init__(self, config, args, model, dataloader, logger=None):
+    """训练与推理管理器。
+
+    参数:
+        config: 训练配置字典
+        args: 运行参数（含 config_path/name 等）
+        model: 扩散模型（需实现 forward 与 generate_mts 等）
+        dataloader: {'dataloader': torch.utils.data.DataLoader}
+        logger: 可选 logger，需实现 log_info/add_scalar
+    """
+    def __init__(self, config: Dict[str, Any], args: Any, model: torch.nn.Module, dataloader: Dict[str, Any], logger=None):
         super().__init__()
         self.model = model
         self.device = self.model.betas.device
@@ -60,7 +79,7 @@ class Trainer(object):
             self.logger.log_info(str(get_model_parameters_info(self.model)))
         self.log_frequency = 100
 
-    def save(self, milestone, verbose=False):
+    def save(self, milestone: int, verbose: bool = False):
         if self.logger is not None and verbose:
             self.logger.log_info('Save current model to {}'.format(str(self.results_folder / f'checkpoint-{milestone}.pt')))
         data = {
@@ -71,16 +90,22 @@ class Trainer(object):
         }
         torch.save(data, str(self.results_folder / f'checkpoint-{milestone}.pt'))
     
-    def save_classifier(self, milestone, verbose=False):
+    def save_classifier(self, milestone: int, verbose: bool = False):
         if self.logger is not None and verbose:
-            self.logger.log_info('Save current classifer to {}'.format(str(self.results_folder / f'ckpt_classfier-{milestone}.pt')))
+            self.logger.log_info('Save current classifier to {}'.format(str(self.results_folder / f'ckpt_classifier-{milestone}.pt')))
         data = {
             'step': self.step_classifier,
             'classifier': self.classifier.state_dict()
         }
-        torch.save(data, str(self.results_folder / f'ckpt_classfier-{milestone}.pt'))
+        # 保存到修正后的文件名
+        torch.save(data, str(self.results_folder / f'ckpt_classifier-{milestone}.pt'))
 
-    def load(self, milestone, verbose=False):
+    # 兼容旧拼写（保留调用，不建议继续使用）
+    def save_classfier(self, milestone: int, verbose: bool = False):  # noqa: D401
+        """Alias of save_classifier (deprecated)."""
+        return self.save_classifier(milestone, verbose)
+
+    def load(self, milestone: int, verbose: bool = False):
         if self.logger is not None and verbose:
             self.logger.log_info('Resume from {}'.format(str(self.results_folder / f'checkpoint-{milestone}.pt')))
         device = self.device
@@ -91,16 +116,21 @@ class Trainer(object):
         self.ema.load_state_dict(data['ema'])
         self.milestone = milestone
 
-    def load_classifier(self, milestone, verbose=False):
+    def load_classifier(self, milestone: int, verbose: bool = False):
         if self.logger is not None and verbose:
-            self.logger.log_info('Resume from {}'.format(str(self.results_folder / f'ckpt_classfier-{milestone}.pt')))
+            self.logger.log_info('Resume classifier from {}'.format(str(self.results_folder / f'ckpt_classifier-{milestone}.pt')))
         device = self.device
-        data = torch.load(str(self.results_folder / f'ckpt_classfier-{milestone}.pt'), map_location=device)
+        # 优先加载修正后的文件名，若不存在则回退到历史拼写
+        new_path = self.results_folder / f'ckpt_classifier-{milestone}.pt'
+        old_path = self.results_folder / f'ckpt_classfier-{milestone}.pt'
+        load_path = new_path if new_path.exists() else old_path
+        data = torch.load(str(load_path), map_location=device)
         self.classifier.load_state_dict(data['classifier'])
         self.step_classifier = data['step']
         self.milestone_classifier = milestone
 
     def train(self):
+        """主训练循环（支持 AMP 与梯度累积）。"""
         device = self.device
         step = 0
         loss_log = []  # 保存loss记录
@@ -118,6 +148,15 @@ class Trainer(object):
 
         plt.ion()  # 开启交互式绘图模式（Notebook 实时刷新）
 
+        # 动态导入 Notebook 显示函数（非 Notebook 环境降级为 no-op）
+        try:  # pragma: no cover
+            from IPython.display import display as _nb_display, clear_output as _nb_clear_output
+        except Exception:  # noqa: F401
+            def _nb_display(*args, **kwargs):
+                return None
+            def _nb_clear_output(*args, **kwargs):
+                return None
+
         # 定义滚动平均函数
         def rolling_average(data, window_size=50):
             data = np.array(data)
@@ -127,7 +166,7 @@ class Trainer(object):
 
         # 创建固定figure用于实时更新
         fig, ax = plt.subplots(figsize=(7, 4))
-        plot_display = display(fig, display_id=True)
+        plot_display = _nb_display(fig, display_id=True)
         plt.close(fig)  # 初始关闭，避免多余显示
 
         with tqdm(initial=step, total=self.train_num_steps) as pbar:
@@ -237,32 +276,54 @@ class Trainer(object):
             self.logger.log_info(f"Training done, time: {time.time() - tic:.2f}s")
 
 
-    def sample(self, num, size_every, shape=None, model_kwargs=None, cond_fn=None):
+    def sample(self, num: int, size_every: int, shape: Optional[Tuple[int, int]] = None, model_kwargs: Optional[Dict[str, Any]] = None, cond_fn=None):
+        """从 EMA 模型采样。
+
+        参数:
+            num: 期望采样条数（最终返回精确切片到 num）
+            size_every: 每次批量采样数量（batch size）
+            shape: 可选 (T, C)，仅用于预分配；若为 None 将自动从首次采样推断
+            model_kwargs: 传入生成函数的额外参数
+            cond_fn: 条件引导函数（可选）
+        返回:
+            samples: (num, T, C)
+        """
         if self.logger is not None:
             tic = time.time()
             self.logger.log_info('Begin to sample...')
-        samples = np.empty([0, shape[0], shape[1]])
-        num_cycle = int(num // size_every) + 1
-
+        pieces: List[np.ndarray] = []
+        num_cycle = int(math.ceil(num / float(size_every)))
         for _ in range(num_cycle):
             sample = self.ema.ema_model.generate_mts(batch_size=size_every, model_kwargs=model_kwargs, cond_fn=cond_fn)
-            samples = np.row_stack([samples, sample.detach().cpu().numpy()])
+            pieces.append(sample.detach().cpu().numpy())
             torch.cuda.empty_cache()
+
+        samples = np.concatenate(pieces, axis=0)[:num]
 
         if self.logger is not None:
             self.logger.log_info('Sampling done, time: {:.2f}'.format(time.time() - tic))
         return samples
 
-    def restore(self, raw_dataloader, shape=None, coef=1e-1, stepsize=1e-1, sampling_steps=50):
+    def restore(self, raw_dataloader, shape: Optional[Tuple[int, int]] = None, coef: float = 1e-1, stepsize: float = 1e-1, sampling_steps: int = 50):
+        """基于条件填充的恢复（imputation）。
+
+        参数:
+            raw_dataloader: 产出 (x, t_m) 的数据迭代器，x 与掩码同形 (B, T, C)
+            coef: Langevin 日志项系数
+            stepsize: Langevin 学习率
+            sampling_steps: 采样步数；等于模型总步数则使用逐步采样，否则使用加速采样
+        返回:
+            samples, reals, masks: 分别为 (N, T, C)
+        """
         if self.logger is not None:
             tic = time.time()
             self.logger.log_info('Begin to restore...')
         model_kwargs = {}
         model_kwargs['coef'] = coef
         model_kwargs['learning_rate'] = stepsize
-        samples = np.empty([0, shape[0], shape[1]])
-        reals = np.empty([0, shape[0], shape[1]])
-        masks = np.empty([0, shape[0], shape[1]])
+        samples_list: List[np.ndarray] = []
+        reals_list: List[np.ndarray] = []
+        masks_list: List[np.ndarray] = []
 
         for idx, (x, t_m) in enumerate(raw_dataloader):
             x, t_m = x.to(self.device), t_m.to(self.device)
@@ -273,23 +334,35 @@ class Trainer(object):
                 sample = self.ema.ema_model.fast_sample_infill(shape=x.shape, target=x*t_m, partial_mask=t_m, model_kwargs=model_kwargs,
                                                                sampling_timesteps=sampling_steps)
 
-            samples = np.row_stack([samples, sample.detach().cpu().numpy()])
-            reals = np.row_stack([reals, x.detach().cpu().numpy()])
-            masks = np.row_stack([masks, t_m.detach().cpu().numpy()])
+            samples_list.append(sample.detach().cpu().numpy())
+            reals_list.append(x.detach().cpu().numpy())
+            masks_list.append(t_m.detach().cpu().numpy())
         
+        samples = np.concatenate(samples_list, axis=0) if samples_list else np.empty((0,))
+        reals = np.concatenate(reals_list, axis=0) if reals_list else np.empty((0,))
+        masks = np.concatenate(masks_list, axis=0) if masks_list else np.empty((0,))
+
         if self.logger is not None:
             self.logger.log_info('Imputation done, time: {:.2f}'.format(time.time() - tic))
         return samples, reals, masks
         # return samples
 
-    def forward_sample(self, x_start):
-       b, c, h = x_start.shape
-       noise = torch.randn_like(x_start, device=self.device)
-       t = torch.randint(0, self.model.num_timesteps, (b,), device=self.device).long()
-       x_t = self.model.q_sample(x_start=x_start, t=t, noise=noise).detach()
-       return x_t, t
+    def forward_sample(self, x_start: torch.Tensor):
+        """前向扩散一次，返回 x_t 与时间步 t。
 
-    def train_classfier(self, classifier):
+        参数:
+            x_start: (B, T, C)
+        返回:
+            x_t: (B, T, C), t: (B,)
+        """
+        b, c, h = x_start.shape
+        noise = torch.randn_like(x_start, device=self.device)
+        t = torch.randint(0, self.model.num_timesteps, (b,), device=self.device).long()
+        x_t = self.model.q_sample(x_start=x_start, t=t, noise=noise).detach()
+        return x_t, t
+
+    def train_classifier(self, classifier: torch.nn.Module):
+        """训练时间步条件分类器（用于引导采样）。"""
         device = self.device
         step = 0
         self.milestone_classifier = 0
@@ -314,7 +387,7 @@ class Trainer(object):
                     x, y = x.to(device), y.to(device)
                     x_t, t = self.forward_sample(x)
                     with autocast(enabled=self.amp_enabled, dtype=torch.float16):
-                        logits = classifier(x_t, t)
+                        logits = self.classifier(x_t, t)
                         loss = F.cross_entropy(logits, y)
                         loss = loss / self.gradient_accumulate_every
                     scaler_cls.scale(loss).backward()
@@ -333,10 +406,10 @@ class Trainer(object):
                 with torch.no_grad():
                     if self.step_classifier != 0 and self.step_classifier % self.save_cycle == 0:
                         self.milestone_classifier += 1
-                        self.save_classfier(self.milestone_classifier)
+                        self.save_classifier(self.milestone_classifier)
                                             
                     if self.logger is not None and self.step_classifier % self.log_frequency == 0:
-                        self.logger.add_scalar(tag='train/loss', scalar_value=total_loss, global_step=self.step)
+                        self.logger.add_scalar(tag='train/loss', scalar_value=total_loss, global_step=self.step_classifier)
 
                 pbar.update(1)
 
@@ -345,4 +418,9 @@ class Trainer(object):
             self.logger.log_info('Training done, time: {:.2f}'.format(time.time() - tic))
 
         # return classifier
+
+    # 兼容旧拼写入口（不建议继续使用）
+    def train_classfier(self, classifier: torch.nn.Module):  # noqa: D401
+        """Alias of train_classifier (deprecated)."""
+        return self.train_classifier(classifier)
 
