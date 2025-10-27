@@ -21,7 +21,7 @@ from einops import rearrange, reduce, repeat
 from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
 from Models.interpretable_diffusion.model_utils import LearnablePositionalEncoding, Conv_MLP,\
                                                        AdaLayerNorm, Transpose, GELU2, series_decomp
-from Models.interpretable_diffusion.layers.attention import FullAttention, CrossAttention
+from Models.interpretable_diffusion.layers.attention import FullAttention, CrossAttention, FreqAttention
 from Models.interpretable_diffusion.layers.decomposition import TrendBlock, MovingBlock, FourierLayer, SeasonBlock
 
 
@@ -43,7 +43,13 @@ class EncoderBlock(nn.Module):
                  attn_pdrop=0.1,
                  resid_pdrop=0.1,
                  mlp_hidden_times=4,
-                 activate='GELU'
+                 activate='GELU',
+                 use_freq_attn=False,
+                 freq_size=None,
+                 freq_heads=4,
+                 freq_head_dim=16,
+                 freq_pdrop=0.1,
+                 freq_resid_pdrop=0.1,
                  ):
         super().__init__()
 
@@ -55,6 +61,22 @@ class EncoderBlock(nn.Module):
                 attn_pdrop=attn_pdrop,
                 resid_pdrop=resid_pdrop,
             )
+
+        # optional frequency-axis attention branch（并行分支，门控）
+        self.use_freq_attn = use_freq_attn
+        if self.use_freq_attn:
+            assert freq_size is not None, 'freq_size must be provided when use_freq_attn is True'
+            self.freq_attn = FreqAttention(
+                n_embd=n_embd,
+                freq_size=freq_size,
+                n_head=freq_heads,
+                head_dim=freq_head_dim,
+                attn_pdrop=freq_pdrop,
+                resid_pdrop=freq_resid_pdrop,
+            )
+            # gating parameter for frequency branch (ReZero-like start at 0)
+            self.gate_f = nn.Parameter(torch.tensor(0.0))
+            self.freq_dropout = nn.Dropout(freq_pdrop)
         
         assert activate in ['GELU', 'GELU2']
         act = nn.GELU() if activate == 'GELU' else GELU2()
@@ -67,8 +89,16 @@ class EncoderBlock(nn.Module):
             )
         
     def forward(self, x, timestep, mask=None, label_emb=None):
-        a, att = self.attn(self.ln1(x, timestep, label_emb), mask=mask)  # a: (B,T,C), att: (B,T,T)
+        # Pre-normalize once and reuse for both time and freq branches
+        x_norm = self.ln1(x, timestep, label_emb)
+        a, att = self.attn(x_norm, mask=mask)  # a: (B,T,C), att: (B,T,T)
         x = x + a
+
+        # 并行频域分支：以 pre-norm 的输入为基础，计算沿频域的注意力并门控融合
+        if getattr(self, 'use_freq_attn', False):
+            a_freq, att_freq = self.freq_attn(x_norm)  # a_freq: (B,T,C)
+            a_freq = self.freq_dropout(a_freq)
+            x = x + self.gate_f * a_freq
         x = x + self.mlp(self.ln2(x))   # MLP 残差
         return x, att
 
@@ -87,16 +117,28 @@ class Encoder(nn.Module):
         resid_pdrop=0.,
         mlp_hidden_times=4,
         block_activate='GELU',
+        use_freq_attn=False,
+        freq_size=None,
+        freq_heads=4,
+        freq_head_dim=16,
+        freq_pdrop=0.1,
+        freq_resid_pdrop=0.1,
     ):
         super().__init__()
-
+        self.use_freq_attn = use_freq_attn
         self.blocks = nn.Sequential(*[EncoderBlock(
                 n_embd=n_embd,
                 n_head=n_head,
                 attn_pdrop=attn_pdrop,
                 resid_pdrop=resid_pdrop,
                 mlp_hidden_times=mlp_hidden_times,
-                activate=block_activate,
+        activate=block_activate,
+        use_freq_attn=use_freq_attn,
+        freq_size=freq_size,
+        freq_heads=freq_heads,
+        freq_head_dim=freq_head_dim,
+        freq_pdrop=freq_pdrop,
+        freq_resid_pdrop=freq_resid_pdrop,
         ) for _ in range(n_layer)])
 
     def forward(self, input, t, padding_masks=None, label_emb=None):
@@ -127,6 +169,12 @@ class DecoderBlock(nn.Module):
                  mlp_hidden_times=4,
                  activate='GELU',
                  condition_dim=1024,
+                 use_freq_attn=False,
+                 freq_size=None,
+                 freq_heads=4,
+                 freq_head_dim=16,
+                 freq_pdrop=0.1,
+                 freq_resid_pdrop=0.1,
                  ):
         super().__init__()
         
@@ -139,6 +187,18 @@ class DecoderBlock(nn.Module):
                 attn_pdrop=attn_pdrop, 
                 resid_pdrop=resid_pdrop,
                 )
+        # optional frequency attention branch (并联 + 门控)，放在 self-attn 之后、cross-attn 之前
+        self.use_freq_attn = use_freq_attn
+        if self.use_freq_attn:
+            assert freq_size is not None, 'freq_size must be provided when use_freq_attn=True'
+            self.freq_attn = FreqAttention(n_embd=n_embd,
+                                           freq_size=freq_size,
+                                           n_head=freq_heads,
+                                           head_dim=freq_head_dim,
+                                           attn_pdrop=freq_pdrop,
+                                           resid_pdrop=freq_resid_pdrop)
+            self.gate_f = nn.Parameter(torch.tensor(0.0))
+            self.freq_dropout = nn.Dropout(freq_pdrop)
         self.attn2 = CrossAttention(
                 n_embd=n_embd,
                 condition_embd=condition_dim,
@@ -172,8 +232,14 @@ class DecoderBlock(nn.Module):
 
     def forward(self, x, encoder_output, timestep, mask=None, label_emb=None):
         # 自注意力
-        a, att = self.attn1(self.ln1(x, timestep, label_emb), mask=mask)  # a: (B,T,C)
+        x_norm = self.ln1(x, timestep, label_emb)
+        a, att = self.attn1(x_norm, mask=mask)  # a: (B,T,C)
         x = x + a
+        # 并行频域分支（放在自注意力后、交叉注意力前）
+        if getattr(self, 'use_freq_attn', False):
+            a_freq, att_freq = self.freq_attn(x_norm)  # a_freq: (B,T,C)
+            a_freq = self.freq_dropout(a_freq)
+            x = x + self.gate_f * a_freq
         # 交叉注意力
         a, att = self.attn2(self.ln1_1(x, timestep), encoder_output, mask=mask)  # a: (B,T,C)
         x = x + a
@@ -216,11 +282,18 @@ class Decoder(nn.Module):
         resid_pdrop=0.1,
         mlp_hidden_times=4,
         block_activate='GELU',
-        condition_dim=512    
+        condition_dim=512,
+        use_freq_attn=False,
+        freq_size=None,
+        freq_heads=4,
+        freq_head_dim=16,
+        freq_pdrop=0.1,
+        freq_resid_pdrop=0.1,
     ):
         super().__init__()
         self.d_model = n_embd
         self.n_feat = n_feat
+        # pass through freq-attn params from parent if present
         self.blocks = nn.Sequential(*[DecoderBlock(
                 n_feat=n_feat,
                 n_channel=n_channel,
@@ -231,6 +304,12 @@ class Decoder(nn.Module):
                 mlp_hidden_times=mlp_hidden_times,
                 activate=block_activate,
                 condition_dim=condition_dim,
+                use_freq_attn=use_freq_attn,
+                freq_size=freq_size,
+                freq_heads=freq_heads,
+                freq_head_dim=freq_head_dim,
+                freq_pdrop=freq_pdrop,
+                freq_resid_pdrop=freq_resid_pdrop,
         ) for _ in range(n_layer)])
       
     def forward(self, x, t, enc, padding_masks=None, label_emb=None):
@@ -294,11 +373,24 @@ class Transformer(nn.Module):
         self.combine_m = nn.Conv1d(n_layer_dec, 1, kernel_size=1, stride=1, padding=0,
                                    padding_mode='circular', bias=False)
 
-        self.encoder = Encoder(n_layer_enc, n_embd, n_heads, attn_pdrop, resid_pdrop, mlp_hidden_times, block_activate)
+        # frequency-attention related args (from model params / kwargs)
+        self.use_freq_attn = bool(kwargs.get('use_freq_attn', False))
+        freq_heads = int(kwargs.get('freq_heads', kwargs.get('h_f', 4)))
+        freq_head_dim = int(kwargs.get('freq_d_model', kwargs.get('d_f', 16)))
+        freq_pdrop = float(kwargs.get('freq_dropout', 0.1))
+
+        # Encoder / Decoder: pass frequency-attn params through to blocks
+        self.encoder = Encoder(n_layer_enc, n_embd, n_heads, attn_pdrop, resid_pdrop, mlp_hidden_times, block_activate,
+                               use_freq_attn=self.use_freq_attn, freq_size=n_feat,
+                               freq_heads=freq_heads, freq_head_dim=freq_head_dim,
+                               freq_pdrop=freq_pdrop, freq_resid_pdrop=freq_pdrop)
         self.pos_enc = LearnablePositionalEncoding(n_embd, dropout=resid_pdrop, max_len=max_len)
 
         self.decoder = Decoder(n_channel, n_feat, n_embd, n_heads, n_layer_dec, attn_pdrop, resid_pdrop, mlp_hidden_times,
-                               block_activate, condition_dim=n_embd)
+                               block_activate, condition_dim=n_embd,
+                               use_freq_attn=self.use_freq_attn, freq_size=n_feat,
+                               freq_heads=freq_heads, freq_head_dim=freq_head_dim,
+                               freq_pdrop=freq_pdrop, freq_resid_pdrop=freq_pdrop)
         self.pos_dec = LearnablePositionalEncoding(n_embd, dropout=resid_pdrop, max_len=max_len)
 
     def forward(self, input, t, padding_masks=None, return_res=False):
