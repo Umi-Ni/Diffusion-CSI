@@ -39,6 +39,10 @@ solver:
       warmup: 500 
       verbose: False
 
+  amp:
+    enabled: true   
+    dtype: fp16     # 4090不支持bf16，A100支持
+
 dataloader:
   train_dataset:
     target: Utils.Data_utils.csi_datasets.CustomDataset

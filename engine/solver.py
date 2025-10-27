@@ -12,6 +12,7 @@ from tqdm.auto import tqdm
 from ema_pytorch import EMA
 from torch.optim import Adam
 from torch.nn.utils import clip_grad_norm_
+from torch.cuda.amp import autocast, GradScaler
 from Utils.io_utils import instantiate_from_config, get_model_parameters_info
 
 
@@ -51,6 +52,14 @@ class Trainer(object):
         sc_cfg = config['solver']['scheduler']
         sc_cfg['params']['optimizer'] = self.opt
         self.sch = instantiate_from_config(sc_cfg)
+
+        # AMP (mixed precision) settings
+        amp_cfg = config['solver'].get('amp', {}) if isinstance(config.get('solver'), dict) else {}
+        self.amp_enabled = bool(amp_cfg.get('enabled', True))  # 默认开启以缓解显存压力
+        # 仅控制 autocast 的 dtype；scaler 的 enabled 控制是否生效
+        amp_dtype_str = str(amp_cfg.get('dtype', 'fp16')).lower()
+        self.amp_dtype = torch.float16 if amp_dtype_str == 'fp16' else torch.bfloat16
+        self.scaler = GradScaler(enabled=self.amp_enabled)
 
         if self.logger is not None:
             self.logger.log_info(str(get_model_parameters_info(self.model)))
@@ -132,14 +141,21 @@ class Trainer(object):
                     # gradient accumulation
                     for _ in range(self.gradient_accumulate_every):
                         data = next(self.dl).to(device)
-                        loss = self.model(data, target=data)
-                        loss = loss / self.gradient_accumulate_every
-                        loss.backward()
-                        total_loss += loss.item()
+                        with autocast(enabled=self.amp_enabled, dtype=self.amp_dtype):
+                            loss = self.model(data, target=data)
+                            loss = loss / self.gradient_accumulate_every
+                        # scaled backward
+                        self.scaler.scale(loss).backward()
+                        total_loss += float(loss.detach().item())
 
                     # optimizer step
+                    # unscale for gradient clipping
+                    if self.amp_enabled:
+                        self.scaler.unscale_(self.opt)
                     clip_grad_norm_(self.model.parameters(), 1.0)
-                    self.opt.step()
+                    # use scaler to step
+                    self.scaler.step(self.opt)
+                    self.scaler.update()
                     self.sch.step(total_loss)
                     self.opt.zero_grad()
                     self.step += 1
@@ -291,15 +307,19 @@ class Trainer(object):
                     x, y = next(dataloader)
                     x, y = x.to(device), y.to(device)
                     x_t, t = self.forward_sample(x)
-                    logits = classifier(x_t, t)
-                    loss = F.cross_entropy(logits, y)
-                    loss = loss / self.gradient_accumulate_every
-                    loss.backward()
-                    total_loss += loss.item()
+                    with autocast(enabled=self.amp_enabled, dtype=self.amp_dtype):
+                        logits = classifier(x_t, t)
+                        loss = F.cross_entropy(logits, y)
+                        loss = loss / self.gradient_accumulate_every
+                    self.scaler.scale(loss).backward()
+                    total_loss += float(loss.detach().item())
 
                 pbar.set_description(f'loss: {total_loss:.6f}')
 
+                if self.amp_enabled:
+                    self.scaler.unscale_(self.opt_classifier)
                 self.opt_classifier.step()
+                self.scaler.update()
                 self.opt_classifier.zero_grad()
                 self.step_classifier += 1
                 step += 1
