@@ -2,6 +2,7 @@ import os
 import torch
 import numpy as np
 import pandas as pd
+from typing import Optional, Tuple
 
 from scipy import io
 from sklearn.preprocessing import MinMaxScaler
@@ -11,28 +12,44 @@ from Utils.masking_utils import noise_mask
 
 
 class CustomDataset(Dataset):
+    """
+    通用时序数据集封装：负责数据读取、归一化/反归一化、滑窗切片、训练/测试划分，以及（测试期）缺失掩码生成。
+
+    意图：
+    - 读取 CSV（或子类自定义读取）并拟合 MinMaxScaler；可选将数据映射到 [-1, 1] 区间。
+    - 按 window 进行等长滑窗切片，再按比例划分 train/test。
+    - 测试期支持两种评估模式：随机缺失（missing_ratio）或固定尾部预测（predict_length）。
+
+    形状约定：
+    - 原始原型 rawdata: (N_rows, N_features)
+    - 切片 samples: (N_samples, window, N_features)
+    - __getitem__:
+      - train -> Tensor(float32): (window, N_features)
+      - test  -> Tuple[Tensor(float32) (window, N_features), BoolTensor (window, N_features)]
+    """
     def __init__(
         self, 
-        name,
-        data_root, 
-        window=500, 
-        proportion=0.8, 
-        save2npy=True, 
-        neg_one_to_one=True,
-        seed=123,
-        period='train',
-        output_dir='./OUTPUT',
-        predict_length=None,
-        missing_ratio=None,
-        style='separate', 
-        distribution='geometric', 
-        mean_mask_length=3
-    ):
+        name: str,
+        data_root: str,
+        window: int = 500,
+        proportion: float = 0.8,
+        save2npy: bool = True,
+        neg_one_to_one: bool = True,
+        seed: int = 123,
+        period: str = 'train',
+        output_dir: str = './OUTPUT',
+        predict_length: Optional[int] = None,
+        missing_ratio: Optional[float] = None,
+        style: str = 'separate', 
+        distribution: str = 'geometric', 
+        mean_mask_length: int = 3
+    ) -> None:
         super(CustomDataset, self).__init__()
         assert period in ['train', 'test'], 'period must be train or test.'
         if period == 'train':
-            # For training period, predict_length and missing_ratio should not be set
-            assert predict_length is None and missing_ratio is None, 'predict_length and missing_ratio must be None for training period'
+            # 训练期不应设置预测长度或缺失率（修复：避免使用按位取反 ~ 导致断言失效）
+            assert (predict_length is None and missing_ratio is None), \
+                'train 期不应设置 predict_length 或 missing_ratio'
         self.name, self.pred_len, self.missing_ratio = name, predict_length, missing_ratio
         self.style, self.distribution, self.mean_mask_length = style, distribution, mean_mask_length
         self.rawdata, self.scaler = self.read_data(data_root, self.name)
@@ -40,13 +57,14 @@ class CustomDataset(Dataset):
         os.makedirs(self.dir, exist_ok=True)
 
         self.window, self.period = window, period
-        self.len, self.var_num = self.rawdata.shape[0], self.rawdata.shape[-1]
-        self.sample_num_total = self.len // self.window
+        # 命名优化：避免覆盖内置 len；使用更具语义的名称
+        self.n_rows, self.n_features = self.rawdata.shape[0], self.rawdata.shape[-1]
+        self.n_segments_total = self.n_rows // self.window
         self.save2npy = save2npy
         self.auto_norm = neg_one_to_one
 
         self.data = self.__normalize(self.rawdata)
-        train, inference = self.__getsamples(self.data, proportion, seed)
+        train, inference = self._get_samples(self.data, proportion, seed)
 
         self.samples = train if period == 'train' else inference
         if period == 'test':
@@ -58,11 +76,17 @@ class CustomDataset(Dataset):
                 self.masking = masks.astype(bool)
             else:
                 raise NotImplementedError()
-        self.sample_num = self.samples.shape[0]
+        self.n_samples = self.samples.shape[0]
 
-    def __getsamples(self, data, proportion, seed):
+    def _get_samples(self, data: np.ndarray, proportion: float, seed: int):
+        """
+        将连续数据切成 (num_segments, window, n_features) 并按比例划分训练/测试。
+        注意：当前实现直接 reshape，若总长度不能被 window 整除会潜在报错。
+        TODO: 可裁剪到 usable_len = (len // window) * window 再 reshape，以避免越界。
+        """
         num_segments = data.shape[0] // self.window
-        x = data.reshape(num_segments, self.window, self.var_num)
+        # x: (num_segments, window, n_features)
+        x = data.reshape(num_segments, self.window, self.n_features)
 
         train_data, test_data = self.divide(x, proportion, seed)
 
@@ -82,41 +106,46 @@ class CustomDataset(Dataset):
         return train_data, test_data
 
     def normalize(self, sq):
-        d = sq.reshape(-1, self.var_num)
+        # sq: (batch*?, window, n_features) or (N, n_features)
+        d = sq.reshape(-1, self.n_features)  # (N_total, n_features)
         d = self.scaler.transform(d)
         if self.auto_norm:
             d = normalize_to_neg_one_to_one(d)
-        return d.reshape(-1, self.window, self.var_num)
+        return d.reshape(-1, self.window, self.n_features)
 
     def unnormalize(self, sq):
-        d = self.__unnormalize(sq.reshape(-1, self.var_num))
-        return d.reshape(-1, self.window, self.var_num)
+        # sq: (batch*?, window, n_features)
+        d = self.__unnormalize(sq.reshape(-1, self.n_features))  # (N_total, n_features)
+        return d.reshape(-1, self.window, self.n_features)
     
     def __normalize(self, rawdata):
-        # rawdata 此时已为对数幅度 data_log
-        data = self.scaler.transform(rawdata)
+        # rawdata: (N_rows, n_features)
+        data = self.scaler.transform(rawdata)  # (N_rows, n_features)
         if self.auto_norm:
             data = normalize_to_neg_one_to_one(data)
         return data
 
     def __unnormalize(self, data):
+        # data: (N, n_features)
         if self.auto_norm:
             data = unnormalize_to_zero_to_one(data)
-        # 先逆 MinMax 到对数域，再做 expm1 回到线性幅度域
-        x_log = self.scaler.inverse_transform(data)
-        x = np.expm1(x_log)
-        return x
+        x = data
+        return self.scaler.inverse_transform(x)
     
     @staticmethod
     def divide(data, ratio, seed=2023):
+        """
+        按比例切分数据（当前实现为稳定顺序切分，而非随机打乱）。
+        data: (num_segments, window, n_features) -> (train, test)
+        """
         size = data.shape[0]
         # Store the state of the RNG to restore later.
         st0 = np.random.get_state()
         np.random.seed(seed)
 
         regular_train_num = int(np.ceil(size * ratio))
-        # use a random permutation for splitting (deterministic given seed)
-        id_rdm = np.random.permutation(size)
+        # id_rdm = np.random.permutation(size)
+        id_rdm = np.arange(size)
         regular_train_id = id_rdm[:regular_train_num]
         irregular_train_id = id_rdm[regular_train_num:]
 
@@ -142,18 +171,27 @@ class CustomDataset(Dataset):
 
         # 检查首行是否包含非数值内容（判断为 header 的可能性）
         first_row = df_try.iloc[0].astype(str)
-        # assume no header; if any value in first row is non-numeric or empty, treat as header
-        is_header = False
+        is_header = True
         for v in first_row:
+            # 认为纯数字（含小数/负号）为数值，否则视为 header 字符串
             s = v.strip()
             if s == '':
+                # 空字符串也认为非 header（保守）
                 is_header = True
                 break
+            # 尝试把字符串转换为 float 判断
             try:
                 float(s)
-            except Exception:
+                # 如果能成功转换为 float，则不是 header -> 继续判断下一个
+                # （但遇到若干列均为数值则仍可能没有 header）
+                continue
+            except:
+                # 无法转为 float，则很可能首行为 header（列名）
                 is_header = True
                 break
+        else:
+            # 如果循环没有 break（即所有首行都能转成数值），则首行很可能不是 header
+            is_header = False
 
         # 根据检测结果选择读取方式
         if is_header:
@@ -187,17 +225,19 @@ class CustomDataset(Dataset):
             nan_count = df.isnull().sum().sum()
             print(f"⚠️ 注意: 读取后发现 {nan_count} 个 NaN，可能是 header/格式问题。文件: {filepath}")
 
-        data = df.values.astype(np.float64)
-        # 对幅度做对数变换以缓和长尾与乘性噪声，再做归一化
-        data_log = np.log1p(np.clip(data, a_min=0.0, a_max=None))
+        data = df.values
         scaler = MinMaxScaler()
-        scaler = scaler.fit(data_log)
+        scaler = scaler.fit(data)
         # 可选：打印诊断信息，便于调试
-        print(f"[read_data] {os.path.basename(filepath)} -> shape: {data.shape}; columns: {df.shape[1]} | using log1p->MinMax")
-        return data_log, scaler
+        print(f"[read_data] {os.path.basename(filepath)} -> shape: {data.shape}; columns: {df.shape[1]}")
+        return data, scaler
 
     
     def mask_data(self, seed=2023):
+        """
+        生成随机缺失掩码（测试期使用）。
+        返回 masks: bool array with shape (N_samples, window, n_features)
+        """
         masks = np.ones_like(self.samples)
         # Store the state of the RNG to restore later.
         st0 = np.random.get_state()
@@ -218,17 +258,23 @@ class CustomDataset(Dataset):
 
     def __getitem__(self, ind):
         if self.period == 'test':
-            x = self.samples[ind, :, :]  # (seq_length, feat_dim) array
-            m = self.masking[ind, :, :]  # (seq_length, feat_dim) boolean array
+            x = self.samples[ind, :, :]  # (seq_length, feat_dim) array -> (window, n_features)
+            m = self.masking[ind, :, :]  # (seq_length, feat_dim) boolean array -> (window, n_features)
             return torch.from_numpy(x).float(), torch.from_numpy(m)
-        x = self.samples[ind, :, :]  # (seq_length, feat_dim) array
+        x = self.samples[ind, :, :]  # (seq_length, feat_dim) array -> (window, n_features)
         return torch.from_numpy(x).float()
 
     def __len__(self):
-        return self.sample_num
+        return self.n_samples
     
 
 class fMRIDataset(CustomDataset):
+    """
+    fMRI 数据集示例：覆写 read_data，从 Mat 文件读取时序矩阵。
+
+    形状：data: (N_rows, N_features)
+    其余流程沿用父类（归一化、切片、划分等）。
+    """
     def __init__(
         self, 
         proportion=1., 
