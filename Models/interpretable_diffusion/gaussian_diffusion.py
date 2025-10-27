@@ -395,12 +395,17 @@ class Diffusion_TS(nn.Module):
 
         # fourier loss 可选：对时间维进行 FFT（通过转置将时间维置于最后一维）
         if self.use_ff:
-            fft1 = torch.fft.fft(model_out.transpose(1, 2), norm='forward')
-            fft2 = torch.fft.fft(target.transpose(1, 2), norm='forward')
+            # 在 FFT 段禁用 autocast 并转换为 FP32，避免 cuFFT 的 FP16 长度限制
+            with torch.cuda.amp.autocast(enabled=False):
+                mo32 = model_out.transpose(1, 2).to(torch.float32)
+                ta32 = target.transpose(1, 2).to(torch.float32)
+                fft1 = torch.fft.fft(mo32, norm='forward')
+                fft2 = torch.fft.fft(ta32, norm='forward')
             fft1, fft2 = fft1.transpose(1, 2), fft2.transpose(1, 2)
+            # fourier_loss 以 FP32 计算，再与原损失做 dtype 对齐
             fourier_loss = self.loss_fn(torch.real(fft1), torch.real(fft2), reduction='none') \
                            + self.loss_fn(torch.imag(fft1), torch.imag(fft2), reduction='none')
-            train_loss = train_loss + self.ff_weight * fourier_loss
+            train_loss = train_loss + self.ff_weight * fourier_loss.to(train_loss.dtype)
 
         return train_loss
 

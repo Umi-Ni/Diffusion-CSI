@@ -26,20 +26,29 @@ class FourierLayer(nn.Module):
         """季节性前向：在时间维执行 rFFT 并保留主频分量，回到时域。
         x: (B, T, D) -> seasonal (B, T, D)
         """
+        # 为规避 cuFFT 对 FP16 的限制（长度需为 2 的幂），在 FFT 段强制使用 FP32 并禁用 autocast
+        orig_dtype = x.dtype
         b, t, d = x.shape
-        x_freq = torch.fft.rfft(x, dim=1)  # (B, F_rfft, D)
+        with torch.cuda.amp.autocast(enabled=False):
+            x32 = x.to(torch.float32)
+            x_freq = torch.fft.rfft(x32, dim=1)  # (B, F_rfft, D), complex64
 
-        if t % 2 == 0:
-            x_freq = x_freq[:, self.low_freq:-1]
-            f = torch.fft.rfftfreq(t)[self.low_freq:-1]
-        else:
-            x_freq = x_freq[:, self.low_freq:]
-            f = torch.fft.rfftfreq(t)[self.low_freq:]
+            if t % 2 == 0:
+                x_freq = x_freq[:, self.low_freq:-1]
+                f = torch.fft.rfftfreq(t)
+                f = f[self.low_freq:-1]
+            else:
+                x_freq = x_freq[:, self.low_freq:]
+                f = torch.fft.rfftfreq(t)
+                f = f[self.low_freq:]
 
-        x_freq, index_tuple = self.topk_freq(x_freq)  # 选取幅值最大的 top-k 频率
-        f = repeat(f, 'f -> b f d', b=x_freq.size(0), d=x_freq.size(2)).to(x_freq.device)
-        f = rearrange(f[index_tuple], 'b f d -> b f () d').to(x_freq.device)  # (B, F_k, 1, D)
-        return self.extrapolate(x_freq, f, t)
+            x_freq, index_tuple = self.topk_freq(x_freq)  # 选取幅值最大的 top-k 频率
+            # 准备频率索引（在 CPU 上生成，再搬到目标设备）
+            f = repeat(f, 'f -> b f d', b=x_freq.size(0), d=x_freq.size(2)).to(x_freq.device)
+            f = rearrange(f[index_tuple], 'b f d -> b f () d').to(x_freq.device)  # (B, F_k, 1, D)
+            seasonal32 = self.extrapolate(x_freq, f, t)  # FP32 时域合成
+
+        return seasonal32.to(orig_dtype)
 
     def extrapolate(self, x_freq, f, t):
         """将频域选出的分量回到时域：幅值-相位形式合成余弦波并求和。
