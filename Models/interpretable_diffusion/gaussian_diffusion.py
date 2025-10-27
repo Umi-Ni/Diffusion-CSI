@@ -33,6 +33,18 @@ def cosine_beta_schedule(timesteps, s=0.008):
 
 
 class Diffusion_TS(nn.Module):
+    """
+    时间序列扩散模型（Diffusion-TS）。
+    主要作用：
+    - 使用 Transformer 主干建模趋势与季节性并合成输出；
+    - 构建扩散过程的调度参数，支持标准与快速采样；
+    - 训练阶段可引入频域损失（可选）与相关性正则（通道相关 + 时间自相关）。
+
+    Shape 约定（默认）：
+    - Unless otherwise specified, tensors follow shape (B, T, C):
+      B = batch size, T = seq_length (time), C = feature_size (channels/subcarriers).
+    - 在某些统计计算（如通道相关矩阵）中，会显式说明临时使用 (B, C, T)。
+    """
     def __init__(
             self,
             seq_length,
@@ -57,8 +69,24 @@ class Diffusion_TS(nn.Module):
             **kwargs
     ):
         """
-        Diffusion-TS 模型初始化。
-        支持标准扩散参数配置，同时允许关闭 FFT 约束并添加时序相关性正则项。
+        模型初始化：构建 Transformer 主体与扩散所需的缓冲张量与配置项。
+        作用：
+        - 初始化 Transformer（编码/解码）与必要的投影超参；
+        - 根据 beta 调度（linear/cosine）生成扩散系数与其累计量；
+        - 配置训练损失（点对点、可选的频域）与相关性正则。
+
+        Inputs:
+        - seq_length: int, 时间长度 T
+        - feature_size: int, 特征/通道数 C
+        - timesteps: int, 扩散总步数
+        - sampling_timesteps: Optional[int], 采样步数（若 < timesteps 则为快速采样）
+        - loss_type: str, 'l1' 或 'l2'
+        - beta_schedule: str, 'linear' 或 'cosine'
+        - use_ff: bool, 是否启用频域（FFT）损失
+        - corr_weight: float, 相关性正则的权重
+
+        Shapes:
+        - 默认输入/输出: (B, T, C)
         """
 
         super(Diffusion_TS, self).__init__()
@@ -142,18 +170,53 @@ class Diffusion_TS(nn.Module):
 
 
     def predict_noise_from_start(self, x_t, t, x0):
+        """
+        由去噪起点 x0 与当前噪声步 x_t 反推噪声项。
+
+        Inputs:
+        - x_t: 当前步样本, (B, T, C)
+        - t: 时间步, (B,)
+        - x0: 预测的起点, (B, T, C)
+
+        Returns:
+        - noise: 估计噪声, (B, T, C)
+        """
         return (
                 (extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t - x0) /
                 extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
         )
     
     def predict_start_from_noise(self, x_t, t, noise):
+        """
+        由 x_t 与噪声项重构去噪起点 x0。
+
+        Inputs:
+        - x_t: 当前步样本, (B, T, C)
+        - t: 时间步, (B,)
+        - noise: 噪声, (B, T, C)
+
+        Returns:
+        - x0: 起点估计, (B, T, C)
+        """
         return (
             extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
             extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
         )
 
     def q_posterior(self, x_start, x_t, t):
+        """
+        计算 q(x_{t-1} | x_t, x_0) 的后验均值与方差（扩散前向过程的逆推）。
+
+        Inputs:
+        - x_start: 起点 x0, (B, T, C)
+        - x_t: 当前步样本, (B, T, C)
+        - t: 时间步, (B,)
+
+        Returns:
+        - posterior_mean: (B, T, C)
+        - posterior_variance: (B, T, C)
+        - posterior_log_variance_clipped: (B, T, C)
+        """
         posterior_mean = (
                 extract(self.posterior_mean_coef1, t, x_t.shape) * x_start +
                 extract(self.posterior_mean_coef2, t, x_t.shape) * x_t
@@ -163,11 +226,29 @@ class Diffusion_TS(nn.Module):
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
     
     def output(self, x, t, padding_masks=None):
+        """
+        前向主干：调用 Transformer 得到趋势与季节性并求和作为模型输出。
+
+        Inputs:
+        - x: 输入序列（可为加噪序列）, (B, T, C)
+        - t: 时间步, (B,)
+        - padding_masks: Optional[BoolTensor], (B, T)
+
+        Returns:
+        - model_output: (B, T, C)
+        """
         trend, season = self.model(x, t, padding_masks=padding_masks)
         model_output = trend + season
         return model_output
 
     def model_predictions(self, x, t, clip_x_start=False, padding_masks=None):
+        """
+        预测去噪起点与对应噪声。
+
+        Returns:
+        - pred_noise: (B, T, C)
+        - x_start: (B, T, C)
+        """
         if padding_masks is None:
             padding_masks = torch.ones(x.shape[0], self.seq_length, dtype=bool, device=x.device)
 
@@ -178,6 +259,9 @@ class Diffusion_TS(nn.Module):
         return pred_noise, x_start
 
     def p_mean_variance(self, x, t, clip_denoised=True):
+        """
+        基于模型预测得到 p(x_{t-1} | x_t) 的均值和方差，并可选裁剪 x_0 估计。
+        """
         _, x_start = self.model_predictions(x, t)
         if clip_denoised:
             x_start.clamp_(-1., 1.)
@@ -186,6 +270,18 @@ class Diffusion_TS(nn.Module):
         return model_mean, posterior_variance, posterior_log_variance, x_start
     
     def p_sample(self, x, t: int, clip_denoised=True, cond_fn=None, model_kwargs=None):
+        """
+        反向一步采样：x_t -> x_{t-1}
+
+        Inputs:
+        - x: 当前步样本, (B, T, C)
+        - t: int, 当前时间步
+        - cond_fn: Optional[Callable], 条件梯度函数 grad log p(y|x)
+
+        Returns:
+        - pred_series: 下一步样本, (B, T, C)
+        - x_start: 起点估计, (B, T, C)
+        """
         b, *_, device = *x.shape, self.betas.device
         batched_times = torch.full((x.shape[0],), t, device=x.device, dtype=torch.long)
         model_mean, _, model_log_variance, x_start = \
@@ -200,6 +296,12 @@ class Diffusion_TS(nn.Module):
 
     @torch.no_grad()
     def sample(self, shape):
+        """
+        标准逐步采样，从纯噪声开始生成样本。
+
+        Inputs:
+        - shape: Tuple, (B, T, C)
+        """
         device = self.betas.device
         img = torch.randn(shape, device=device)
         for t in tqdm(reversed(range(0, self.num_timesteps)),
@@ -209,6 +311,9 @@ class Diffusion_TS(nn.Module):
 
     @torch.no_grad()
     def fast_sample(self, shape, clip_denoised=True):
+        """
+        快速采样（DDIM 类似），使用更稀疏的时间步序列进行生成。
+        """
         batch, device, total_timesteps, sampling_timesteps, eta = \
             shape[0], self.betas.device, self.num_timesteps, self.sampling_timesteps, self.eta
 
@@ -239,6 +344,10 @@ class Diffusion_TS(nn.Module):
         return img
     
     def generate_mts(self, batch_size=16, model_kwargs=None, cond_fn=None):
+        """
+        生成多条时间序列样本，自动选择标准或快速采样，并可选条件函数。
+        Returns: (B, T, C)
+        """
         feature_size, seq_length = self.feature_size, self.seq_length
         if cond_fn is not None:
             sample_fn = self.fast_sample_cond if self.fast_sampling else self.sample_cond
@@ -256,13 +365,120 @@ class Diffusion_TS(nn.Module):
             raise ValueError(f'invalid loss type {self.loss_type}')
 
     def q_sample(self, x_start, t, noise=None):
+        """
+        前向加噪：x_0 -> x_t。
+
+        Inputs:
+        - x_start: 起点 x0, (B, T, C)
+        - t: 时间步, (B,)
+        - noise: Optional, (B, T, C)
+        """
         noise = default(noise, lambda: torch.randn_like(x_start))
         return (
                 extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
                 extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
+    def _compute_pointwise_and_fourier_loss(self, model_out, target):
+        """
+        计算点对点损失（L1/L2），并在启用 use_ff 时叠加频域（FFT）损失。
+
+        Inputs:
+        - model_out: (B, T, C)
+        - target: (B, T, C)
+
+        Returns:
+        - train_loss: 张量形式的逐元素/逐位置损失（不进行 batch 归约），shape 同 model_out
+        """
+        # 基础点对点损失（L1 或 L2）
+        train_loss = self.loss_fn(model_out, target, reduction='none')
+
+        # fourier loss 可选：对时间维进行 FFT（通过转置将时间维置于最后一维）
+        if self.use_ff:
+            fft1 = torch.fft.fft(model_out.transpose(1, 2), norm='forward')
+            fft2 = torch.fft.fft(target.transpose(1, 2), norm='forward')
+            fft1, fft2 = fft1.transpose(1, 2), fft2.transpose(1, 2)
+            fourier_loss = self.loss_fn(torch.real(fft1), torch.real(fft2), reduction='none') \
+                           + self.loss_fn(torch.imag(fft1), torch.imag(fft2), reduction='none')
+            train_loss = train_loss + self.ff_weight * fourier_loss
+
+        return train_loss
+
+    def _compute_correlation_regularization(self, model_out, target, train_loss_device):
+        """
+        计算相关性正则项：通道相关矩阵差 + 时间自相关差。
+
+        说明/约定：
+        - 默认输入/输出整体约定为 (B, T, C)；本段为按时间统计通道相关的运算，注释中将视作 (B, C, T)。
+        - 为保持现有行为，不改变任何张量维度顺序，仅沿用原有实现的计算方式。
+
+        Returns:
+        - corr_loss_batch: (B,) 每个样本的相关性损失
+        """
+        # ---------- 相关性正则项（时域） ----------
+        corr_loss_batch = torch.zeros((model_out.shape[0],), device=train_loss_device)
+
+        # Shapes for this block (as-is in current implementation):
+        # model_out, target: (B, C, T) where C = channels, T = time
+        B, C, T = model_out.shape
+        eps = self._corr_eps
+
+        # (1) 通道间相关矩阵差
+        Xm = model_out      # (B, C, T)
+        Ym = target         # (B, C, T)
+        Xc = Xm - Xm.mean(dim=2, keepdim=True)
+        Yc = Ym - Ym.mean(dim=2, keepdim=True)
+
+        # 样本级协方差矩阵与相关系数
+        cov_X = torch.matmul(Xc, Xc.transpose(1, 2)) / float(max(T - 1, 1))   # (B, C, C)
+        cov_Y = torch.matmul(Yc, Yc.transpose(1, 2)) / float(max(T - 1, 1))   # (B, C, C)
+        var_X = cov_X.diagonal(dim1=1, dim2=2)  # (B, C)
+        var_Y = cov_Y.diagonal(dim1=1, dim2=2)  # (B, C)
+        std_X = torch.sqrt(var_X.clamp(min=0.) + eps)  # (B, C)
+        std_Y = torch.sqrt(var_Y.clamp(min=0.) + eps)
+        denom_X = std_X.unsqueeze(2) * std_X.unsqueeze(1)  # (B, C, C)
+        denom_Y = std_Y.unsqueeze(2) * std_Y.unsqueeze(1)  # (B, C, C)
+        corr_X = cov_X / (denom_X + eps)
+        corr_Y = cov_Y / (denom_Y + eps)
+        channel_corr_loss = F.l1_loss(corr_X, corr_Y, reduction='none')  # (B, C, C)
+        channel_corr_loss = channel_corr_loss.view(B, -1).mean(dim=1)    # (B,)
+
+        # (2) 时间自相关差（逐通道、逐 lag）
+        K = min(self.corr_max_lag, T - 1)
+        if K > 0:
+            temporal_losses = torch.zeros((B, C), device=train_loss_device)
+            for k in range(1, K + 1):
+                num_X = (Xc[:, :, :T - k] * Xc[:, :, k:]).sum(dim=2)  # (B, C)
+                num_Y = (Yc[:, :, :T - k] * Yc[:, :, k:]).sum(dim=2)  # (B, C)
+                denom = ((T - k) * (std_X * std_X + eps))            # (B, C)
+                ac_X = num_X / (denom + eps)
+                ac_Y = num_Y / (denom + eps)
+                temporal_losses += torch.abs(ac_X - ac_Y)
+            temporal_autocorr_loss = temporal_losses.mean(dim=1) / float(K)  # (B,)
+        else:
+            temporal_autocorr_loss = torch.zeros((B,), device=train_loss_device)
+
+        corr_loss_batch = channel_corr_loss + self.corr_time_weight * temporal_autocorr_loss
+        return corr_loss_batch
+
+    def _finalize_loss(self, train_loss, t, corr_loss_batch):
+        """
+        将逐位置损失按样本均值化，叠加相关性损失权重后，乘以时间步重加权项并做 batch 均值。
+
+        Returns:
+        - 标量损失（Tensor scalar）
+        """
+        train_loss = reduce(train_loss, 'b ... -> b (...)', 'mean')  # per-sample mean
+        train_loss = train_loss + self.corr_weight * corr_loss_batch.unsqueeze(1)  # shape (B, 1)
+        train_loss = train_loss * extract(self.loss_weight, t, train_loss.shape)
+        return train_loss.mean()
+
     def _train_loss(self, x_start, t, target=None, noise=None, padding_masks=None):
+        """
+        训练一步：在给定噪声步 t 下计算损失（点对点 + 可选频域 + 相关性正则）。
+
+        默认输入/输出形状为 (B, T, C)。在通道相关/自相关的统计计算中，下文明确标注临时形状 (B, C, T)。
+        """
         # 基本噪声采样与模型输出（保持原逻辑）
         noise = default(noise, lambda: torch.randn_like(x_start))
         if target is None:
@@ -271,104 +487,33 @@ class Diffusion_TS(nn.Module):
         x = self.q_sample(x_start=x_start, t=t, noise=noise)  # noise sample
         model_out = self.output(x, t, padding_masks)
 
-        # 基础点对点损失（L1 或 L2）
-        train_loss = self.loss_fn(model_out, target, reduction='none')
+        # 点对点 + 可选频域损失（不改逻辑）
+        train_loss = self._compute_pointwise_and_fourier_loss(model_out, target)
 
-        # fourier loss 部分保持可选（你已经决定不使用 fft，对应 use_ff=False）
-        fourier_loss = torch.tensor([0.], device=train_loss.device)
-        if self.use_ff:
-            fft1 = torch.fft.fft(model_out.transpose(1, 2), norm='forward')
-            fft2 = torch.fft.fft(target.transpose(1, 2), norm='forward')
-            fft1, fft2 = fft1.transpose(1, 2), fft2.transpose(1, 2)
-            fourier_loss = self.loss_fn(torch.real(fft1), torch.real(fft2), reduction='none')\
-                           + self.loss_fn(torch.imag(fft1), torch.imag(fft2), reduction='none')
-            train_loss += self.ff_weight * fourier_loss
+        # 相关性正则（不改逻辑）
+        corr_loss_batch = self._compute_correlation_regularization(
+            model_out=model_out,
+            target=target,
+            train_loss_device=train_loss.device,
+        )
 
-        # ---------- 新增：相关性正则项（时域） ----------
-        corr_loss_batch = torch.zeros((x_start.shape[0],), device=train_loss.device)
-
-        # Shapes:
-        # model_out, target: (B, C, T)  where C = channels (子载波数), T = 时间长度
-        B, C, T = model_out.shape
-        eps = self._corr_eps
-
-        # (1) 通道间相关矩阵差：对每个样本计算 CxC 的相关矩阵并比较
-        # 中心化： subtract time-mean
-        # Xc shape: (B, C, T)
-        Xm = model_out
-        Ym = target
-        Xc = Xm - Xm.mean(dim=2, keepdim=True)
-        Yc = Ym - Ym.mean(dim=2, keepdim=True)
-
-        # 计算样本级协方差矩阵： cov = Xc @ Xc^T / (T-1) -> shape (B, C, C)
-        # 使用 batch 矩阵乘法
-        cov_X = torch.matmul(Xc, Xc.transpose(1, 2)) / float(max(T - 1, 1))
-        cov_Y = torch.matmul(Yc, Yc.transpose(1, 2)) / float(max(T - 1, 1))
-
-        # 计算标准差向量以归一化为相关系数
-        var_X = cov_X.diagonal(dim1=1, dim2=2)  # shape (B, C)
-        var_Y = cov_Y.diagonal(dim1=1, dim2=2)  # shape (B, C)
-        std_X = torch.sqrt(var_X.clamp(min=0.) + eps)  # (B, C)
-        std_Y = torch.sqrt(var_Y.clamp(min=0.) + eps)
-
-        # outer product of stds for denom
-        denom_X = std_X.unsqueeze(2) * std_X.unsqueeze(1)  # (B, C, C)
-        denom_Y = std_Y.unsqueeze(2) * std_Y.unsqueeze(1)
-
-        corr_X = cov_X / (denom_X + eps)
-        corr_Y = cov_Y / (denom_Y + eps)
-
-        # channel correlation loss (L1)
-        channel_corr_loss = F.l1_loss(corr_X, corr_Y, reduction='none')  # (B, C, C)
-        # take mean per sample
-        channel_corr_loss = channel_corr_loss.view(B, -1).mean(dim=1)  # (B,)
-
-        # (2) 时间自相关差：计算每个通道的自相关序列 upto lag K，并比较
-        K = min(self.corr_max_lag, T - 1)
-        if K > 0:
-            # compute standard deviations per (B,C)
-            # We'll compute numerator for each lag using batch conv-like multiplication
-            # Xc: (B, C, T)
-            temporal_losses = torch.zeros((B, C), device=train_loss.device)
-            for k in range(1, K + 1):
-                # numerator: sum_{t=0}^{T-k-1} X[:, :, t] * X[:, :, t+k]
-                num_X = (Xc[:, :, :T - k] * Xc[:, :, k:]).sum(dim=2)  # (B, C)
-                num_Y = (Yc[:, :, :T - k] * Yc[:, :, k:]).sum(dim=2)  # (B, C)
-                denom = ( (T - k) * (std_X * std_X + eps) )  # approx variance-based denom (B, C)
-                # normalized autocorr approx
-                ac_X = num_X / (denom + eps)
-                ac_Y = num_Y / (denom + eps)
-                temporal_losses += torch.abs(ac_X - ac_Y)  # accumulate L1 across lags
-
-            # average over lags
-            temporal_autocorr_loss = temporal_losses.mean(dim=1) / float(K)  # (B,)
-        else:
-            temporal_autocorr_loss = torch.zeros((B,), device=train_loss.device)
-
-        # combine channel and temporal losses
-        corr_loss_batch = channel_corr_loss + self.corr_time_weight * temporal_autocorr_loss  # (B,)
-
-        # 平均到 batch
-        corr_loss = corr_loss_batch.mean()
-
-        # 把相关性损失加到 train_loss（注意 train_loss 当前形状是 per-sample mean）
-        # train_loss: after reduction 'mean' per sample later, so add corr per-sample before final mean
-        # 为了与点损失量级相近，乘以 self.corr_weight
-        # Expand corr per-element: convert to shape (B,1) and add as constant per sample
-        train_loss = reduce(train_loss, 'b ... -> b (...)', 'mean')  # per-sample mean like before
-        train_loss = train_loss + self.corr_weight * corr_loss_batch.unsqueeze(1)  # shape (B, 1)
-        
-        # 继续按时间步权重缩放并求均值（保持原逻辑）
-        train_loss = train_loss * extract(self.loss_weight, t, train_loss.shape)
-        return train_loss.mean()
+        # 重加权与归约（不改逻辑）
+        return self._finalize_loss(train_loss, t, corr_loss_batch)
 
     def forward(self, x, **kwargs):
+        """
+        训练入口：随机采样时间步 t 并计算一个训练批次的损失。
+        """
         b, c, n, device, feature_size, = *x.shape, x.device, self.feature_size
         assert n == feature_size, f'number of variable must be {feature_size}'
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
         return self._train_loss(x_start=x, t=t, **kwargs)
 
     def return_components(self, x, t: int):
+        """
+        返回在给定 t 下的分解组件（趋势、季节、残差）与加噪后样本。
+        Returns: trend, season, residual, x_t
+        """
         b, c, n, device, feature_size, = *x.shape, x.device, self.feature_size
         assert n == feature_size, f'number of variable must be {feature_size}'
         t = torch.tensor([t])
@@ -378,6 +523,10 @@ class Diffusion_TS(nn.Module):
         return trend, season, residual, x
 
     def fast_sample_infill(self, shape, target, sampling_timesteps, partial_mask=None, clip_denoised=True, model_kwargs=None):
+        """
+        快速条件插值采样：仅在未观测位置进行生成，同时保持已知位置与目标一致。
+        - partial_mask: Bool mask, True 表示使用目标值固定该位置。
+        """
         batch, device, total_timesteps, eta = shape[0], self.betas.device, self.num_timesteps, self.eta
 
         # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
@@ -421,8 +570,8 @@ class Diffusion_TS(nn.Module):
         model_kwargs=None,
     ):
         """
-        Generate samples from the model and yield intermediate samples from
-        each timestep of diffusion.
+        条件插值（慢速）：逐步从噪声生成，并在每一步保持已知位置与目标一致。
+        Generate samples from the model and yield intermediate samples from each timestep of diffusion.
         """
         batch, device = shape[0], self.betas.device
         img = torch.randn(shape, device=device)
@@ -443,6 +592,9 @@ class Diffusion_TS(nn.Module):
         clip_denoised=True,
         model_kwargs=None
     ):
+        """
+        条件插值的单步更新（x_t -> x_{t-1}），对已知位置进行强制替换。
+        """
         b, *_, device = *x.shape, self.betas.device
         batched_times = torch.full((x.shape[0],), t, device=x.device, dtype=torch.long)
         model_mean, _, model_log_variance, _ = \
@@ -471,6 +623,13 @@ class Diffusion_TS(nn.Module):
         t,
         coef_=0.
     ):
+        """
+        Langevin 风格的条件更新：在未观测位置对样本进行梯度步与噪声扰动。
+
+        说明：
+        - K 的取值与学习率缩放依赖于时间步 t（含阈值与缩放“魔法数”），用于早期/中期/后期不同强度的条件收敛；
+        - 不改变任何逻辑，仅在注释中明确此启发式策略的作用范围。
+        """
     
         if t[0].item() < self.num_timesteps * 0.05:
             K = 0
@@ -512,12 +671,10 @@ class Diffusion_TS(nn.Module):
     
     def condition_mean(self, cond_fn, mean, log_variance, x, t, model_kwargs=None):
         """
-        Compute the mean for the previous step, given a function cond_fn that
-        computes the gradient of a conditional log probability with respect to
-        x. In particular, cond_fn computes grad(log(p(y|x))), and we want to
-        condition on y.
+        条件化均值：基于条件梯度 cond_fn 对均值进行修正（Sohl-Dickstein et al., 2015）。
 
-        This uses the conditioning strategy from Sohl-Dickstein et al. (2015).
+        English note:
+        Compute the mean for the previous step given grad log p(y|x) and log variance.
         """
         gradient = cond_fn(x=x, t=t, **model_kwargs)
         new_mean = (
@@ -527,13 +684,8 @@ class Diffusion_TS(nn.Module):
     
     def condition_score(self, cond_fn, x_start, x, t, model_kwargs=None):
         """
-        Compute what the p_mean_variance output would have been, should the
-        model's score function be conditioned by cond_fn.
-
-        See condition_mean() for details on cond_fn.
-
-        Unlike condition_mean(), this instead uses the conditioning strategy
-        from Song et al (2020).
+        条件化分数：基于 cond_fn 对分数进行修正（Song et al., 2020）。
+        English note: Condition the score function and recompute model mean.
         """
         alpha_bar = extract(self.alphas_cumprod, t, x.shape)
 
@@ -552,8 +704,8 @@ class Diffusion_TS(nn.Module):
         cond_fn=None
     ):
         """
-        Generate samples from the model and yield intermediate samples from
-        each timestep of diffusion.
+        条件采样（标准）：使用 cond_fn 在每一步进行条件修正。
+        Generate samples and yield intermediate results across all timesteps.
         """
         batch, device = shape[0], self.betas.device
         img = torch.randn(shape, device=device)
@@ -570,6 +722,9 @@ class Diffusion_TS(nn.Module):
         model_kwargs=None,
         cond_fn=None
     ):
+        """
+        条件采样（快速）：在稀疏时间步上进行条件修正并生成样本。
+        """
         batch, device, total_timesteps, sampling_timesteps, eta = \
             shape[0], self.betas.device, self.num_timesteps, self.sampling_timesteps, self.eta
 

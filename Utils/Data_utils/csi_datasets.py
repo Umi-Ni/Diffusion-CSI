@@ -266,27 +266,4 @@ class CustomDataset(Dataset):
 
     def __len__(self):
         return self.n_samples
-    
 
-class fMRIDataset(CustomDataset):
-    """
-    fMRI 数据集示例：覆写 read_data，从 Mat 文件读取时序矩阵。
-
-    形状：data: (N_rows, N_features)
-    其余流程沿用父类（归一化、切片、划分等）。
-    """
-    def __init__(
-        self, 
-        proportion=1., 
-        **kwargs
-    ):
-        super().__init__(proportion=proportion, **kwargs)
-
-    @staticmethod
-    def read_data(filepath, name=''):
-        """Reads a single .csv
-        """
-        data = io.loadmat(filepath + '/sim4.mat')['ts']
-        scaler = MinMaxScaler()
-        scaler = scaler.fit(data)
-        return data, scaler
