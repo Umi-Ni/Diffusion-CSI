@@ -5,6 +5,7 @@ import torch.nn.functional as F
 
 from torch import nn
 from einops import rearrange, reduce, repeat
+from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
 from Models.interpretable_diffusion.model_utils import LearnablePositionalEncoding, Conv_MLP,\
                                                        AdaLayerNorm, Transpose, GELU2, series_decomp
 
@@ -122,41 +123,88 @@ class SeasonBlock(nn.Module):
 
 class FullAttention(nn.Module):
     def __init__(self,
-                 n_embd, # the embed dim
-                 n_head, # the number of heads
-                 attn_pdrop=0.1, # attention dropout prob
-                 resid_pdrop=0.1, # residual attention dropout prob
+                 n_embd,          # embedding dimension
+                 n_head,          # number of attention heads
+                 attn_pdrop=0.1,  # attention dropout
+                 resid_pdrop=0.1, # residual dropout
+                 use_rope=False,  # 🔹是否启用RoPE位置编码
+                 max_seq_len=512  # 🔹RoPE最大序列长度（可调）
     ):
         super().__init__()
         assert n_embd % n_head == 0
-        # key, query, value projections for all heads
+        self.n_head = n_head
+        self.use_rope = use_rope
+
+        # QKV投影
         self.key = nn.Linear(n_embd, n_embd)
         self.query = nn.Linear(n_embd, n_embd)
         self.value = nn.Linear(n_embd, n_embd)
 
-        # regularization
+        # 正则化与输出
         self.attn_drop = nn.Dropout(attn_pdrop)
         self.resid_drop = nn.Dropout(resid_pdrop)
-        # output projection
         self.proj = nn.Linear(n_embd, n_embd)
-        self.n_head = n_head
+
+        # 🔹若启用RoPE，初始化旋转位置编码
+        if self.use_rope:
+            head_dim = n_embd // n_head
+            self.rotary_emb = RotaryEmbedding(dim=head_dim)
 
     def forward(self, x, mask=None):
+        """
+        Args:
+            x: Tensor (B, T, C)
+            mask: Optional attention mask
+        """
         B, T, C = x.size()
-        k = self.key(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = self.query(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = self.value(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1))) # (B, nh, T, T)
 
-        att = F.softmax(att, dim=-1) # (B, nh, T, T)
+        # --- Q, K, V计算 ---
+        q = self.query(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        k = self.key(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)    # (B, nh, T, hs)
+        v = self.value(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+
+        # --- 🔹RoPE旋转位置编码（仅当启用时） ---
+        if self.use_rope:
+            pos = torch.arange(T, device=x.device)
+            rotary_pos_emb = self.rotary_emb(pos)
+            q, k = apply_rotary_emb(rotary_pos_emb, q, k)
+
+        # --- 标准点乘注意力 ---
+        att = (q @ k.transpose(-2, -1)) / math.sqrt(k.size(-1))  # (B, nh, T, T)
+        if mask is not None:
+            # 自动调整mask形状
+            # att.shape: (B, n_head, T, T)
+            # mask可能是(B, T)或(B, 1, 1, T)
+            if mask.dim() == 2:
+                # 扩展到(B, 1, 1, T)
+                mask = mask[:, None, None, :]
+            elif mask.dim() == 3 and mask.shape[1] == 1:
+                # 扩展到(B, 1, T, T)
+                mask = mask[:, :, None, :]
+            # 自动裁剪或pad到当前注意力长度
+            T_att = att.size(-1)
+            T_mask = mask.size(-1)
+            if T_mask < T_att:
+                # 若mask短于序列，右侧pad
+                pad_len = T_att - T_mask
+                mask = F.pad(mask, (0, pad_len), value=1)
+            elif T_mask > T_att:
+                # 若mask长于序列，裁剪
+                mask = mask[..., :T_att]
+            att = att.masked_fill(mask == 0, float('-inf'))
+
+
+        att = F.softmax(att, dim=-1)
         att = self.attn_drop(att)
-        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side, (B, T, C)
-        att = att.mean(dim=1, keepdim=False) # (B, T, T)
 
-        # output projection
+        # --- 聚合输出 ---
+        y = att @ v  # (B, nh, T, hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)  # (B, T, C)
         y = self.resid_drop(self.proj(y))
-        return y, att
+
+        # 返回平均注意力图（用于可视化等）
+        att_mean = att.mean(dim=1, keepdim=False)
+        return y, att_mean
 
 
 class CrossAttention(nn.Module):
@@ -269,7 +317,7 @@ class Encoder(nn.Module):
 
 
 class DecoderBlock(nn.Module):
-    """ an unassuming Transformer block """
+    """ an unassuming Transformer block (modified with learnable trend/season scaling) """
     def __init__(self,
                  n_channel,
                  n_feat,
@@ -305,10 +353,13 @@ class DecoderBlock(nn.Module):
         assert activate in ['GELU', 'GELU2']
         act = nn.GELU() if activate == 'GELU' else GELU2()
 
+        # 原有趋势与季节模块
         self.trend = TrendBlock(n_channel, n_channel, n_embd, n_feat, act=act)
-        # self.decomp = MovingBlock(n_channel)
         self.seasonal = FourierLayer(d_model=n_embd)
-        # self.seasonal = SeasonBlock(n_channel, n_channel)
+
+        # ✅ 新增：可学习缩放系数
+        self.trend_scale = nn.Parameter(torch.tensor(0.0))
+        self.season_scale = nn.Parameter(torch.tensor(0.0))
 
         self.mlp = nn.Sequential(
             nn.Linear(n_embd, mlp_hidden_times * n_embd),
@@ -321,15 +372,25 @@ class DecoderBlock(nn.Module):
         self.linear = nn.Linear(n_embd, n_feat)
 
     def forward(self, x, encoder_output, timestep, mask=None, label_emb=None):
+        # 自注意力
         a, att = self.attn1(self.ln1(x, timestep, label_emb), mask=mask)
         x = x + a
+        # 交叉注意力
         a, att = self.attn2(self.ln1_1(x, timestep), encoder_output, mask=mask)
         x = x + a
+
+        # 趋势 + 季节性建模（带缩放系数）
         x1, x2 = self.proj(x).chunk(2, dim=1)
-        trend, season = self.trend(x1), self.seasonal(x2)
+        trend = self.trend_scale * self.trend(x1)
+        season = self.season_scale * self.seasonal(x2)
+
+        # MLP 残差块
         x = x + self.mlp(self.ln2(x))
+
+        # 去均值操作
         m = torch.mean(x, dim=1, keepdim=True)
         return x - m, self.linear(m), trend, season
+
     
 
 class Decoder(nn.Module):

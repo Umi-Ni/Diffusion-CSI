@@ -51,27 +51,54 @@ class Diffusion_TS(nn.Module):
             resid_pd=0.,
             kernel_size=None,
             padding_size=None,
-            use_ff=True,
-            reg_weight=None,
+            use_ff=False,          # 不使用 FFT（CSI 无相位）
+            reg_weight=None,       # Fourier loss 权重（保留参数但不使用）
+            corr_weight=0.1,       # 🔹新增：时间相关性正则项的权重
             **kwargs
     ):
+        """
+        Diffusion-TS 模型初始化。
+        支持标准扩散参数配置，同时允许关闭 FFT 约束并添加时序相关性正则项。
+        """
+
         super(Diffusion_TS, self).__init__()
 
-        self.eta, self.use_ff = eta, use_ff
+        # ========== 基本配置 ==========
+        self.eta = eta
+        self.use_ff = use_ff
         self.seq_length = seq_length
         self.feature_size = feature_size
+        self.corr_weight = corr_weight  # λ，总体相关性权重
+        self._corr_eps = 1e-8
+        self.corr_time_weight = 0.5     # μ，时间自相关在总相关性损失中的权重
+        self.corr_max_lag = 10          # K，时间自相关最大 lag
+
+        # Fourier loss 权重（若 use_ff=False，将不会被使用）
         self.ff_weight = default(reg_weight, math.sqrt(self.seq_length) / 5)
 
-        self.model = Transformer(n_feat=feature_size, n_channel=seq_length, n_layer_enc=n_layer_enc, n_layer_dec=n_layer_dec,
-                                 n_heads=n_heads, attn_pdrop=attn_pd, resid_pdrop=resid_pd, mlp_hidden_times=mlp_hidden_times,
-                                 max_len=seq_length, n_embd=d_model, conv_params=[kernel_size, padding_size], **kwargs)
+        # ========== Transformer 编码器/解码器 ==========
+        self.model = Transformer(
+            n_feat=feature_size,
+            n_channel=seq_length,
+            n_layer_enc=n_layer_enc,
+            n_layer_dec=n_layer_dec,
+            n_heads=n_heads,
+            attn_pdrop=attn_pd,
+            resid_pdrop=resid_pd,
+            mlp_hidden_times=mlp_hidden_times,
+            max_len=seq_length,
+            n_embd=d_model,
+            conv_params=[kernel_size, padding_size],
+            **kwargs
+        )
 
+        # ========== β 调度策略 ==========
         if beta_schedule == 'linear':
             betas = linear_beta_schedule(timesteps)
         elif beta_schedule == 'cosine':
             betas = cosine_beta_schedule(timesteps)
         else:
-            raise ValueError(f'unknown beta schedule {beta_schedule}')
+            raise ValueError(f'Unknown beta schedule: {beta_schedule}')
 
         alphas = 1. - betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)
@@ -81,47 +108,38 @@ class Diffusion_TS(nn.Module):
         self.num_timesteps = int(timesteps)
         self.loss_type = loss_type
 
-        # sampling related parameters
-
-        self.sampling_timesteps = default(
-            sampling_timesteps, timesteps)  # default num sampling timesteps to number of timesteps at training
-
+        # ========== 采样配置 ==========
+        self.sampling_timesteps = default(sampling_timesteps, timesteps)
         assert self.sampling_timesteps <= timesteps
         self.fast_sampling = self.sampling_timesteps < timesteps
 
-        # helper function to register buffer from float64 to float32
-
+        # ========== 注册缓冲参数 ==========
         register_buffer = lambda name, val: self.register_buffer(name, val.to(torch.float32))
-
         register_buffer('betas', betas)
         register_buffer('alphas_cumprod', alphas_cumprod)
         register_buffer('alphas_cumprod_prev', alphas_cumprod_prev)
 
-        # calculations for diffusion q(x_t | x_{t-1}) and others
-
+        # 扩散相关计算参数
         register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
         register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1. - alphas_cumprod))
         register_buffer('log_one_minus_alphas_cumprod', torch.log(1. - alphas_cumprod))
         register_buffer('sqrt_recip_alphas_cumprod', torch.sqrt(1. / alphas_cumprod))
         register_buffer('sqrt_recipm1_alphas_cumprod', torch.sqrt(1. / alphas_cumprod - 1))
 
-        # calculations for posterior q(x_{t-1} | x_t, x_0)
-
+        # 后验分布计算参数
         posterior_variance = betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod)
-
-        # above: equal to 1. / (1. / (1. - alpha_cumprod_tm1) + alpha_t / beta_t)
-
         register_buffer('posterior_variance', posterior_variance)
-
-        # below: log calculation clipped because the posterior variance is 0 at the beginning of the diffusion chain
-
         register_buffer('posterior_log_variance_clipped', torch.log(posterior_variance.clamp(min=1e-20)))
         register_buffer('posterior_mean_coef1', betas * torch.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod))
         register_buffer('posterior_mean_coef2', (1. - alphas_cumprod_prev) * torch.sqrt(alphas) / (1. - alphas_cumprod))
 
-        # calculate reweighting
-        
+        # 损失重加权项（对应论文中 training reweighting）
         register_buffer('loss_weight', torch.sqrt(alphas) * torch.sqrt(1. - alphas_cumprod) / betas / 100)
+
+        # ========== 调试信息 ==========
+        print(f"[Diffusion_TS] Initialized with seq_length={seq_length}, feature_size={feature_size}, "
+            f"use_ff={use_ff}, corr_weight={corr_weight}")
+
 
     def predict_noise_from_start(self, x_t, t, x0):
         return (
@@ -245,6 +263,7 @@ class Diffusion_TS(nn.Module):
         )
 
     def _train_loss(self, x_start, t, target=None, noise=None, padding_masks=None):
+        # 基本噪声采样与模型输出（保持原逻辑）
         noise = default(noise, lambda: torch.randn_like(x_start))
         if target is None:
             target = x_start
@@ -252,18 +271,94 @@ class Diffusion_TS(nn.Module):
         x = self.q_sample(x_start=x_start, t=t, noise=noise)  # noise sample
         model_out = self.output(x, t, padding_masks)
 
+        # 基础点对点损失（L1 或 L2）
         train_loss = self.loss_fn(model_out, target, reduction='none')
 
-        fourier_loss = torch.tensor([0.])
+        # fourier loss 部分保持可选（你已经决定不使用 fft，对应 use_ff=False）
+        fourier_loss = torch.tensor([0.], device=train_loss.device)
         if self.use_ff:
             fft1 = torch.fft.fft(model_out.transpose(1, 2), norm='forward')
             fft2 = torch.fft.fft(target.transpose(1, 2), norm='forward')
             fft1, fft2 = fft1.transpose(1, 2), fft2.transpose(1, 2)
             fourier_loss = self.loss_fn(torch.real(fft1), torch.real(fft2), reduction='none')\
                            + self.loss_fn(torch.imag(fft1), torch.imag(fft2), reduction='none')
-            train_loss +=  self.ff_weight * fourier_loss
+            train_loss += self.ff_weight * fourier_loss
+
+        # ---------- 新增：相关性正则项（时域） ----------
+        corr_loss_batch = torch.zeros((x_start.shape[0],), device=train_loss.device)
+
+        # Shapes:
+        # model_out, target: (B, C, T)  where C = channels (子载波数), T = 时间长度
+        B, C, T = model_out.shape
+        eps = self._corr_eps
+
+        # (1) 通道间相关矩阵差：对每个样本计算 CxC 的相关矩阵并比较
+        # 中心化： subtract time-mean
+        # Xc shape: (B, C, T)
+        Xm = model_out
+        Ym = target
+        Xc = Xm - Xm.mean(dim=2, keepdim=True)
+        Yc = Ym - Ym.mean(dim=2, keepdim=True)
+
+        # 计算样本级协方差矩阵： cov = Xc @ Xc^T / (T-1) -> shape (B, C, C)
+        # 使用 batch 矩阵乘法
+        cov_X = torch.matmul(Xc, Xc.transpose(1, 2)) / float(max(T - 1, 1))
+        cov_Y = torch.matmul(Yc, Yc.transpose(1, 2)) / float(max(T - 1, 1))
+
+        # 计算标准差向量以归一化为相关系数
+        var_X = cov_X.diagonal(dim1=1, dim2=2)  # shape (B, C)
+        var_Y = cov_Y.diagonal(dim1=1, dim2=2)  # shape (B, C)
+        std_X = torch.sqrt(var_X.clamp(min=0.) + eps)  # (B, C)
+        std_Y = torch.sqrt(var_Y.clamp(min=0.) + eps)
+
+        # outer product of stds for denom
+        denom_X = std_X.unsqueeze(2) * std_X.unsqueeze(1)  # (B, C, C)
+        denom_Y = std_Y.unsqueeze(2) * std_Y.unsqueeze(1)
+
+        corr_X = cov_X / (denom_X + eps)
+        corr_Y = cov_Y / (denom_Y + eps)
+
+        # channel correlation loss (L1)
+        channel_corr_loss = F.l1_loss(corr_X, corr_Y, reduction='none')  # (B, C, C)
+        # take mean per sample
+        channel_corr_loss = channel_corr_loss.view(B, -1).mean(dim=1)  # (B,)
+
+        # (2) 时间自相关差：计算每个通道的自相关序列 upto lag K，并比较
+        K = min(self.corr_max_lag, T - 1)
+        if K > 0:
+            # compute standard deviations per (B,C)
+            # We'll compute numerator for each lag using batch conv-like multiplication
+            # Xc: (B, C, T)
+            temporal_losses = torch.zeros((B, C), device=train_loss.device)
+            for k in range(1, K + 1):
+                # numerator: sum_{t=0}^{T-k-1} X[:, :, t] * X[:, :, t+k]
+                num_X = (Xc[:, :, :T - k] * Xc[:, :, k:]).sum(dim=2)  # (B, C)
+                num_Y = (Yc[:, :, :T - k] * Yc[:, :, k:]).sum(dim=2)  # (B, C)
+                denom = ( (T - k) * (std_X * std_X + eps) )  # approx variance-based denom (B, C)
+                # normalized autocorr approx
+                ac_X = num_X / (denom + eps)
+                ac_Y = num_Y / (denom + eps)
+                temporal_losses += torch.abs(ac_X - ac_Y)  # accumulate L1 across lags
+
+            # average over lags
+            temporal_autocorr_loss = temporal_losses.mean(dim=1) / float(K)  # (B,)
+        else:
+            temporal_autocorr_loss = torch.zeros((B,), device=train_loss.device)
+
+        # combine channel and temporal losses
+        corr_loss_batch = channel_corr_loss + self.corr_time_weight * temporal_autocorr_loss  # (B,)
+
+        # 平均到 batch
+        corr_loss = corr_loss_batch.mean()
+
+        # 把相关性损失加到 train_loss（注意 train_loss 当前形状是 per-sample mean）
+        # train_loss: after reduction 'mean' per sample later, so add corr per-sample before final mean
+        # 为了与点损失量级相近，乘以 self.corr_weight
+        # Expand corr per-element: convert to shape (B,1) and add as constant per sample
+        train_loss = reduce(train_loss, 'b ... -> b (...)', 'mean')  # per-sample mean like before
+        train_loss = train_loss + self.corr_weight * corr_loss_batch.unsqueeze(1)  # shape (B, 1)
         
-        train_loss = reduce(train_loss, 'b ... -> b (...)', 'mean')
+        # 继续按时间步权重缩放并求均值（保持原逻辑）
         train_loss = train_loss * extract(self.loss_weight, t, train_loss.shape)
         return train_loss.mean()
 
