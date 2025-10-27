@@ -3,254 +3,40 @@ import torch
 import numpy as np
 import torch.nn.functional as F
 
+"""
+约定与阅读指南
+----------------
+本文件实现了用于可解释时序建模的 Transformer 组件，包含趋势/季节性分解与注意力模块。
+
+形状约定（默认）：
+- 注意力子层使用序列形状 (B, T, C)，其中 B: batch, T: 序列长度, C: 通道/嵌入维度。
+- 卷积与时序分解模块多使用 (B, C, L) 形式，其中 L 通常与 T 对齐；名称差异仅源于历史习惯。
+- 在发生 view/transpose/rearrange 的位置，尽量标注英文形状注释便于跟踪维度变化。
+
+说明：以下修改仅增加注释与文档，不改变任何已有逻辑与接口。
+"""
+
 from torch import nn
 from einops import rearrange, reduce, repeat
 from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
 from Models.interpretable_diffusion.model_utils import LearnablePositionalEncoding, Conv_MLP,\
                                                        AdaLayerNorm, Transpose, GELU2, series_decomp
+from Models.interpretable_diffusion.layers.attention import FullAttention, CrossAttention
+from Models.interpretable_diffusion.layers.decomposition import TrendBlock, MovingBlock, FourierLayer, SeasonBlock
 
 
-class TrendBlock(nn.Module):
-    """
-    Model trend of time series using the polynomial regressor.
-    """
-    def __init__(self, in_dim, out_dim, in_feat, out_feat, act):
-        super(TrendBlock, self).__init__()
-        trend_poly = 3
-        self.trend = nn.Sequential(
-            nn.Conv1d(in_channels=in_dim, out_channels=trend_poly, kernel_size=3, padding=1),
-            act,
-            Transpose(shape=(1, 2)),
-            nn.Conv1d(in_feat, out_feat, 3, stride=1, padding=1)
-        )
-
-        lin_space = torch.arange(1, out_dim + 1, 1) / (out_dim + 1)
-        self.poly_space = torch.stack([lin_space ** float(p + 1) for p in range(trend_poly)], dim=0)
-
-    def forward(self, input):
-        b, c, h = input.shape
-        x = self.trend(input).transpose(1, 2)
-        trend_vals = torch.matmul(x.transpose(1, 2), self.poly_space.to(x.device))
-        trend_vals = trend_vals.transpose(1, 2)
-        return trend_vals
-    
-
-class MovingBlock(nn.Module):
-    """
-    Model trend of time series using the moving average.
-    """
-    def __init__(self, out_dim):
-        super(MovingBlock, self).__init__()
-        size = max(min(int(out_dim / 4), 24), 4)
-        self.decomp = series_decomp(size)
-
-    def forward(self, input):
-        b, c, h = input.shape
-        x, trend_vals = self.decomp(input)
-        return x, trend_vals
-
-
-class FourierLayer(nn.Module):
-    """
-    Model seasonality of time series using the inverse DFT.
-    """
-    def __init__(self, d_model, low_freq=1, factor=1):
-        super().__init__()
-        self.d_model = d_model
-        self.factor = factor
-        self.low_freq = low_freq
-
-    def forward(self, x):
-        """x: (b, t, d)"""
-        b, t, d = x.shape
-        x_freq = torch.fft.rfft(x, dim=1)
-
-        if t % 2 == 0:
-            x_freq = x_freq[:, self.low_freq:-1]
-            f = torch.fft.rfftfreq(t)[self.low_freq:-1]
-        else:
-            x_freq = x_freq[:, self.low_freq:]
-            f = torch.fft.rfftfreq(t)[self.low_freq:]
-
-        x_freq, index_tuple = self.topk_freq(x_freq)
-        f = repeat(f, 'f -> b f d', b=x_freq.size(0), d=x_freq.size(2)).to(x_freq.device)
-        f = rearrange(f[index_tuple], 'b f d -> b f () d').to(x_freq.device)
-        return self.extrapolate(x_freq, f, t)
-
-    def extrapolate(self, x_freq, f, t):
-        x_freq = torch.cat([x_freq, x_freq.conj()], dim=1)
-        f = torch.cat([f, -f], dim=1)
-        t = rearrange(torch.arange(t, dtype=torch.float),
-                      't -> () () t ()').to(x_freq.device)
-
-        amp = rearrange(x_freq.abs(), 'b f d -> b f () d')
-        phase = rearrange(x_freq.angle(), 'b f d -> b f () d')
-        x_time = amp * torch.cos(2 * math.pi * f * t + phase)
-        return reduce(x_time, 'b f t d -> b t d', 'sum')
-
-    def topk_freq(self, x_freq):
-        length = x_freq.shape[1]
-        top_k = int(self.factor * math.log(length))
-        values, indices = torch.topk(x_freq.abs(), top_k, dim=1, largest=True, sorted=True)
-        mesh_a, mesh_b = torch.meshgrid(torch.arange(x_freq.size(0)), torch.arange(x_freq.size(2)), indexing='ij')
-        index_tuple = (mesh_a.unsqueeze(1), indices, mesh_b.unsqueeze(1))
-        x_freq = x_freq[index_tuple]
-        return x_freq, index_tuple
-    
-
-class SeasonBlock(nn.Module):
-    """
-    Model seasonality of time series using the Fourier series.
-    """
-    def __init__(self, in_dim, out_dim, factor=1):
-        super(SeasonBlock, self).__init__()
-        season_poly = factor * min(32, int(out_dim // 2))
-        self.season = nn.Conv1d(in_channels=in_dim, out_channels=season_poly, kernel_size=1, padding=0)
-        fourier_space = torch.arange(0, out_dim, 1) / out_dim
-        p1, p2 = (season_poly // 2, season_poly // 2) if season_poly % 2 == 0 \
-            else (season_poly // 2, season_poly // 2 + 1)
-        s1 = torch.stack([torch.cos(2 * np.pi * p * fourier_space) for p in range(1, p1 + 1)], dim=0)
-        s2 = torch.stack([torch.sin(2 * np.pi * p * fourier_space) for p in range(1, p2 + 1)], dim=0)
-        self.poly_space = torch.cat([s1, s2])
-
-    def forward(self, input):
-        b, c, h = input.shape
-        x = self.season(input)
-        season_vals = torch.matmul(x.transpose(1, 2), self.poly_space.to(x.device))
-        season_vals = season_vals.transpose(1, 2)
-        return season_vals
-
-
-class FullAttention(nn.Module):
-    def __init__(self,
-                 n_embd,          # embedding dimension
-                 n_head,          # number of attention heads
-                 attn_pdrop=0.1,  # attention dropout
-                 resid_pdrop=0.1, # residual dropout
-                 use_rope=False,  # 🔹是否启用RoPE位置编码
-                 max_seq_len=512  # 🔹RoPE最大序列长度（可调）
-    ):
-        super().__init__()
-        assert n_embd % n_head == 0
-        self.n_head = n_head
-        self.use_rope = use_rope
-
-        # QKV投影
-        self.key = nn.Linear(n_embd, n_embd)
-        self.query = nn.Linear(n_embd, n_embd)
-        self.value = nn.Linear(n_embd, n_embd)
-
-        # 正则化与输出
-        self.attn_drop = nn.Dropout(attn_pdrop)
-        self.resid_drop = nn.Dropout(resid_pdrop)
-        self.proj = nn.Linear(n_embd, n_embd)
-
-        # 🔹若启用RoPE，初始化旋转位置编码
-        if self.use_rope:
-            head_dim = n_embd // n_head
-            self.rotary_emb = RotaryEmbedding(dim=head_dim)
-
-    def forward(self, x, mask=None):
-        """
-        Args:
-            x: Tensor (B, T, C)
-            mask: Optional attention mask
-        """
-        B, T, C = x.size()
-
-        # --- Q, K, V计算 ---
-        q = self.query(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-        k = self.key(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)    # (B, nh, T, hs)
-        v = self.value(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-
-        # --- 🔹RoPE旋转位置编码（仅当启用时） ---
-        if self.use_rope:
-            pos = torch.arange(T, device=x.device)
-            rotary_pos_emb = self.rotary_emb(pos)
-            q, k = apply_rotary_emb(rotary_pos_emb, q, k)
-
-        # --- 标准点乘注意力 ---
-        att = (q @ k.transpose(-2, -1)) / math.sqrt(k.size(-1))  # (B, nh, T, T)
-        if mask is not None:
-            # 自动调整mask形状
-            # att.shape: (B, n_head, T, T)
-            # mask可能是(B, T)或(B, 1, 1, T)
-            if mask.dim() == 2:
-                # 扩展到(B, 1, 1, T)
-                mask = mask[:, None, None, :]
-            elif mask.dim() == 3 and mask.shape[1] == 1:
-                # 扩展到(B, 1, T, T)
-                mask = mask[:, :, None, :]
-            # 自动裁剪或pad到当前注意力长度
-            T_att = att.size(-1)
-            T_mask = mask.size(-1)
-            if T_mask < T_att:
-                # 若mask短于序列，右侧pad
-                pad_len = T_att - T_mask
-                mask = F.pad(mask, (0, pad_len), value=1)
-            elif T_mask > T_att:
-                # 若mask长于序列，裁剪
-                mask = mask[..., :T_att]
-            att = att.masked_fill(mask == 0, float('-inf'))
-
-
-        att = F.softmax(att, dim=-1)
-        att = self.attn_drop(att)
-
-        # --- 聚合输出 ---
-        y = att @ v  # (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C)  # (B, T, C)
-        y = self.resid_drop(self.proj(y))
-
-        # 返回平均注意力图（用于可视化等）
-        att_mean = att.mean(dim=1, keepdim=False)
-        return y, att_mean
-
-
-class CrossAttention(nn.Module):
-    def __init__(self,
-                 n_embd, # the embed dim
-                 condition_embd, # condition dim
-                 n_head, # the number of heads
-                 attn_pdrop=0.1, # attention dropout prob
-                 resid_pdrop=0.1, # residual attention dropout prob
-    ):
-        super().__init__()
-        assert n_embd % n_head == 0
-        # key, query, value projections for all heads
-        self.key = nn.Linear(condition_embd, n_embd)
-        self.query = nn.Linear(n_embd, n_embd)
-        self.value = nn.Linear(condition_embd, n_embd)
-        
-        # regularization
-        self.attn_drop = nn.Dropout(attn_pdrop)
-        self.resid_drop = nn.Dropout(resid_pdrop)
-        # output projection
-        self.proj = nn.Linear(n_embd, n_embd)
-        self.n_head = n_head
-
-    def forward(self, x, encoder_output, mask=None):
-        B, T, C = x.size()
-        B, T_E, _ = encoder_output.size()
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        k = self.key(encoder_output).view(B, T_E, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = self.query(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = self.value(encoder_output).view(B, T_E, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1))) # (B, nh, T, T)
-
-        att = F.softmax(att, dim=-1) # (B, nh, T, T)
-        att = self.attn_drop(att)
-        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side, (B, T, C)
-        att = att.mean(dim=1, keepdim=False) # (B, T, T)
-
-        # output projection
-        y = self.resid_drop(self.proj(y))
-        return y, att
+# 注意：FullAttention、CrossAttention、TrendBlock、MovingBlock、FourierLayer、SeasonBlock
+# 已迁移至 Models.interpretable_diffusion.layers 子包中；此处仅做导入以保持逻辑不变。
     
 
 class EncoderBlock(nn.Module):
-    """ an unassuming Transformer block """
+    """
+    基础编码器块：AdaLayerNorm + 自注意力 + 前馈（MLP）残差。
+
+    输入/输出：
+    - x: (B, T, C) -> (B, T, C)
+    - 同步返回平均注意力权重（便于可视化/诊断）。
+    """
     def __init__(self,
                  n_embd=1024,
                  n_head=16,
@@ -281,13 +67,17 @@ class EncoderBlock(nn.Module):
             )
         
     def forward(self, x, timestep, mask=None, label_emb=None):
-        a, att = self.attn(self.ln1(x, timestep, label_emb), mask=mask)
+        a, att = self.attn(self.ln1(x, timestep, label_emb), mask=mask)  # a: (B,T,C), att: (B,T,T)
         x = x + a
-        x = x + self.mlp(self.ln2(x))   # only one really use encoder_output
+        x = x + self.mlp(self.ln2(x))   # MLP 残差
         return x, att
 
 
 class Encoder(nn.Module):
+    """
+    编码器：堆叠多个 EncoderBlock，对输入序列进行上下文编码。
+    输入/输出： (B, T, C) -> (B, T, C)
+    """
     def __init__(
         self,
         n_layer=14,
@@ -310,14 +100,23 @@ class Encoder(nn.Module):
         ) for _ in range(n_layer)])
 
     def forward(self, input, t, padding_masks=None, label_emb=None):
-        x = input
+        x = input  # (B, T, C)
         for block_idx in range(len(self.blocks)):
             x, _ = self.blocks[block_idx](x, t, mask=padding_masks, label_emb=label_emb)
         return x
 
 
 class DecoderBlock(nn.Module):
-    """ an unassuming Transformer block (modified with learnable trend/season scaling) """
+    """
+    解码器块：自注意力 + 交叉注意力 + MLP，并输出趋势/季节性分量。
+    同时包含可学习缩放系数（trend_scale/season_scale），便于稳定训练与解释。
+
+    返回：
+    - x_minus_mean: (B, T, C)  # 去通道均值后
+    - linear_mean: (B, T, n_feat)  # 经线性层映射的均值项
+    - trend: (B, C_token, n_feat)
+    - season: (B, C_token, d_model)
+    """
     def __init__(self,
                  n_channel,
                  n_feat,
@@ -373,27 +172,39 @@ class DecoderBlock(nn.Module):
 
     def forward(self, x, encoder_output, timestep, mask=None, label_emb=None):
         # 自注意力
-        a, att = self.attn1(self.ln1(x, timestep, label_emb), mask=mask)
+        a, att = self.attn1(self.ln1(x, timestep, label_emb), mask=mask)  # a: (B,T,C)
         x = x + a
         # 交叉注意力
-        a, att = self.attn2(self.ln1_1(x, timestep), encoder_output, mask=mask)
+        a, att = self.attn2(self.ln1_1(x, timestep), encoder_output, mask=mask)  # a: (B,T,C)
         x = x + a
 
         # 趋势 + 季节性建模（带缩放系数）
-        x1, x2 = self.proj(x).chunk(2, dim=1)
-        trend = self.trend_scale * self.trend(x1)
-        season = self.season_scale * self.seasonal(x2)
+        x1, x2 = self.proj(x).chunk(2, dim=1)  # (B,2*C,T) -> 两路 (B,C,T)
+        trend = self.trend_scale * self.trend(x1)      # (B,C,n_feat) 通过 TrendBlock
+        season = self.season_scale * self.seasonal(x2)  # (B,C,d_model) 通过 FourierLayer
 
         # MLP 残差块
-        x = x + self.mlp(self.ln2(x))
+        x = x + self.mlp(self.ln2(x))  # (B,T,C)
 
         # 去均值操作
-        m = torch.mean(x, dim=1, keepdim=True)
+        m = torch.mean(x, dim=1, keepdim=True)  # (B,1,C)
         return x - m, self.linear(m), trend, season
 
     
 
 class Decoder(nn.Module):
+    """
+    解码器：堆叠多个 DecoderBlock，并累积趋势/季节性与均值项。
+    输入：
+        - x: (B, T, C)
+        - t: (B,) 或 (B,1)
+        - enc: 编码器输出 (B, T_enc, C)
+    输出：
+        - x: (B, T, C)
+        - mean: (B, n_layer * T, n_feat)
+        - trend: (B, C, n_feat)
+        - season: (B, C, d_model)
+    """
     def __init__(
         self,
         n_channel,
@@ -407,10 +218,10 @@ class Decoder(nn.Module):
         block_activate='GELU',
         condition_dim=512    
     ):
-      super().__init__()
-      self.d_model = n_embd
-      self.n_feat = n_feat
-      self.blocks = nn.Sequential(*[DecoderBlock(
+        super().__init__()
+        self.d_model = n_embd
+        self.n_feat = n_feat
+        self.blocks = nn.Sequential(*[DecoderBlock(
                 n_feat=n_feat,
                 n_channel=n_channel,
                 n_embd=n_embd,
@@ -423,11 +234,11 @@ class Decoder(nn.Module):
         ) for _ in range(n_layer)])
       
     def forward(self, x, t, enc, padding_masks=None, label_emb=None):
-        b, c, _ = x.shape
+        b, c, _ = x.shape  # (B, T, C)
         # att_weights = []
         mean = []
-        season = torch.zeros((b, c, self.d_model), device=x.device)
-        trend = torch.zeros((b, c, self.n_feat), device=x.device)
+        season = torch.zeros((b, c, self.d_model), device=x.device)  # (B,C,d_model)
+        trend = torch.zeros((b, c, self.n_feat), device=x.device)    # (B,C,n_feat)
         for block_idx in range(len(self.blocks)):
             x, residual_mean, residual_trend, residual_season = \
                 self.blocks[block_idx](x, enc, t, mask=padding_masks, label_emb=label_emb)
@@ -435,11 +246,21 @@ class Decoder(nn.Module):
             trend += residual_trend
             mean.append(residual_mean)
 
-        mean = torch.cat(mean, dim=1)
+        mean = torch.cat(mean, dim=1)  # 在层维拼接 (B, n_layer, n_feat) 或 (B, n_layer*T, n_feat) 视映射而定
         return x, mean, trend, season
 
 
 class Transformer(nn.Module):
+    """
+    顶层模型：
+    - 编码器获得条件上下文，解码器在相同嵌入空间生成输出；
+    - 同时组合趋势（trend）与季节性残差（season_error），以提升可解释性。
+
+    输入/输出：
+    - input: (B, C_in, L)
+    - 返回: (trend: (B, C_in, L), season_error: (B, C_in, L))
+    - 若 return_res=True，额外返回纯季节项与中心化残差。
+    """
     def __init__(
         self,
         n_feat,
@@ -481,16 +302,18 @@ class Transformer(nn.Module):
         self.pos_dec = LearnablePositionalEncoding(n_embd, dropout=resid_pdrop, max_len=max_len)
 
     def forward(self, input, t, padding_masks=None, return_res=False):
-        emb = self.emb(input)
-        inp_enc = self.pos_enc(emb)
-        enc_cond = self.encoder(inp_enc, t, padding_masks=padding_masks)
+        emb = self.emb(input)            # (B, C_in, L) -> (B, T, C) 经 Conv_MLP 到嵌入空间
+        inp_enc = self.pos_enc(emb)      # 位置编码 (B, T, C)
+        enc_cond = self.encoder(inp_enc, t, padding_masks=padding_masks)  # (B, T, C)
 
-        inp_dec = self.pos_dec(emb)
+        inp_dec = self.pos_dec(emb)      # (B, T, C)
         output, mean, trend, season = self.decoder(inp_dec, t, enc_cond, padding_masks=padding_masks)
 
-        res = self.inverse(output)
-        res_m = torch.mean(res, dim=1, keepdim=True)
+        res = self.inverse(output)       # (B, C_in, L)
+        res_m = torch.mean(res, dim=1, keepdim=True)  # (B,1,L)
+        # 季节性残差 = season 线性组合 + 残差去中心化
         season_error = self.combine_s(season.transpose(1, 2)).transpose(1, 2) + res - res_m
+        # 趋势 = 多层均值组合 + 残差均值 + 趋势分量
         trend = self.combine_m(mean) + res_m + trend
 
         if return_res:
