@@ -16,11 +16,11 @@ model:
     resid_pd: 0.1
     kernel_size: 5
     padding_size: 2
-  # Frequency attention settings (方案B)
-  use_freq_attn: true
-  freq_heads: 4    # h_f
-  freq_d_model: 16 # d_f (per-head dimension)
-  freq_dropout: 0.1
+    # Frequency attention settings (方案B)
+    use_freq_attn: true
+    freq_heads: 4    # h_f
+    freq_d_model: 16 # d_f (per-head dimension)
+    freq_dropout: 0.1
 
 solver:
   base_lr: 1.0e-5
