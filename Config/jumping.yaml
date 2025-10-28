@@ -16,11 +16,15 @@ model:
     resid_pd: 0.1
     kernel_size: 5
     padding_size: 2
+    # Regularization weights
+    corr_weight: 0.05   # lower correlation regularization when freq-attn is enabled
     # Frequency attention settings (方案B)
     use_freq_attn: true
     freq_heads: 4    # h_f
     freq_d_model: 16 # d_f (per-head dimension)
     freq_dropout: 0.1
+    # Reduce activation memory: enable gradient checkpointing for blocks
+    activation_checkpointing: true
 
 solver:
   base_lr: 1.0e-5

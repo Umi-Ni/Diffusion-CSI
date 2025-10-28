@@ -1,5 +1,6 @@
 import math
 import torch
+from torch.utils.checkpoint import checkpoint
 import numpy as np
 import torch.nn.functional as F
 
@@ -123,9 +124,11 @@ class Encoder(nn.Module):
         freq_head_dim=16,
         freq_pdrop=0.1,
         freq_resid_pdrop=0.1,
+        use_checkpoint=False,
     ):
         super().__init__()
         self.use_freq_attn = use_freq_attn
+        self.use_checkpoint = use_checkpoint
         self.blocks = nn.Sequential(*[EncoderBlock(
                 n_embd=n_embd,
                 n_head=n_head,
@@ -144,7 +147,12 @@ class Encoder(nn.Module):
     def forward(self, input, t, padding_masks=None, label_emb=None):
         x = input  # (B, T, C)
         for block_idx in range(len(self.blocks)):
-            x, _ = self.blocks[block_idx](x, t, mask=padding_masks, label_emb=label_emb)
+            if self.use_checkpoint:
+                def _fn(x_in):
+                    return self.blocks[block_idx](x_in, t, mask=padding_masks, label_emb=label_emb)
+                x, _ = checkpoint(_fn, x)
+            else:
+                x, _ = self.blocks[block_idx](x, t, mask=padding_masks, label_emb=label_emb)
         return x
 
 
@@ -289,10 +297,12 @@ class Decoder(nn.Module):
         freq_head_dim=16,
         freq_pdrop=0.1,
         freq_resid_pdrop=0.1,
+        use_checkpoint=False,
     ):
         super().__init__()
         self.d_model = n_embd
         self.n_feat = n_feat
+        self.use_checkpoint = use_checkpoint
         # pass through freq-attn params from parent if present
         self.blocks = nn.Sequential(*[DecoderBlock(
                 n_feat=n_feat,
@@ -319,8 +329,13 @@ class Decoder(nn.Module):
         season = torch.zeros((b, c, self.d_model), device=x.device)  # (B,C,d_model)
         trend = torch.zeros((b, c, self.n_feat), device=x.device)    # (B,C,n_feat)
         for block_idx in range(len(self.blocks)):
-            x, residual_mean, residual_trend, residual_season = \
-                self.blocks[block_idx](x, enc, t, mask=padding_masks, label_emb=label_emb)
+            if self.use_checkpoint:
+                def _fn(x_in):
+                    return self.blocks[block_idx](x_in, enc, t, mask=padding_masks, label_emb=label_emb)
+                x, residual_mean, residual_trend, residual_season = checkpoint(_fn, x)
+            else:
+                x, residual_mean, residual_trend, residual_season = \
+                    self.blocks[block_idx](x, enc, t, mask=padding_masks, label_emb=label_emb)
             season += residual_season
             trend += residual_trend
             mean.append(residual_mean)
@@ -382,19 +397,30 @@ class Transformer(nn.Module):
         freq_heads = int(kwargs.get('freq_heads', kwargs.get('h_f', 4)))
         freq_head_dim = int(kwargs.get('freq_d_model', kwargs.get('d_f', 16)))
         freq_pdrop = float(kwargs.get('freq_dropout', 0.1))
+        _ckpt_raw = kwargs.get('activation_checkpointing', False)
+        if isinstance(_ckpt_raw, str):
+            use_checkpoint = _ckpt_raw.strip().lower() in ("true", "1", "yes", "on")
+        else:
+            use_checkpoint = bool(_ckpt_raw)
 
-    # Encoder / Decoder: pass frequency-attn params through to blocks
-        self.encoder = Encoder(n_layer_enc, n_embd, n_heads, attn_pdrop, resid_pdrop, mlp_hidden_times, block_activate,
-                               use_freq_attn=self.use_freq_attn, freq_size=n_feat,
-                               freq_heads=freq_heads, freq_head_dim=freq_head_dim,
-                               freq_pdrop=freq_pdrop, freq_resid_pdrop=freq_pdrop)
+        # Encoder / Decoder: pass frequency-attn params through to blocks
+        self.encoder = Encoder(
+            n_layer_enc, n_embd, n_heads, attn_pdrop, resid_pdrop, mlp_hidden_times, block_activate,
+            use_freq_attn=self.use_freq_attn, freq_size=n_feat,
+            freq_heads=freq_heads, freq_head_dim=freq_head_dim,
+            freq_pdrop=freq_pdrop, freq_resid_pdrop=freq_pdrop,
+            use_checkpoint=use_checkpoint
+        )
         self.pos_enc = LearnablePositionalEncoding(n_embd, dropout=resid_pdrop, max_len=max_len)
 
-        self.decoder = Decoder(n_channel, n_feat, n_embd, n_heads, n_layer_dec, attn_pdrop, resid_pdrop, mlp_hidden_times,
-                               block_activate, condition_dim=n_embd,
-                               use_freq_attn=self.use_freq_attn, freq_size=n_feat,
-                               freq_heads=freq_heads, freq_head_dim=freq_head_dim,
-                               freq_pdrop=freq_pdrop, freq_resid_pdrop=freq_pdrop)
+        self.decoder = Decoder(
+            n_channel, n_feat, n_embd, n_heads, n_layer_dec, attn_pdrop, resid_pdrop, mlp_hidden_times,
+            block_activate, condition_dim=n_embd,
+            use_freq_attn=self.use_freq_attn, freq_size=n_feat,
+            freq_heads=freq_heads, freq_head_dim=freq_head_dim,
+            freq_pdrop=freq_pdrop, freq_resid_pdrop=freq_pdrop,
+            use_checkpoint=use_checkpoint
+        )
         self.pos_dec = LearnablePositionalEncoding(n_embd, dropout=resid_pdrop, max_len=max_len)
 
         # 便捷调试输出：在日志中明确频域注意力是否启用及其关键参数
@@ -402,6 +428,8 @@ class Transformer(nn.Module):
             print(f"[Transformer] Frequency-attention ENABLED: freq_heads={freq_heads}, head_dim={freq_head_dim}, F={n_feat}")
         else:
             print("[Transformer] Frequency-attention DISABLED")
+        if use_checkpoint:
+            print("[Transformer] Activation Checkpointing ENABLED (encoder/decoder blocks)")
 
     def forward(self, input, t, padding_masks=None, return_res=False):
         emb = self.emb(input)            # (B, C_in, L) -> (B, T, C) 经 Conv_MLP 到嵌入空间
