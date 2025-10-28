@@ -119,6 +119,14 @@ class Diffusion_TS(nn.Module):
             conv_params=[kernel_size, padding_size],
             **kwargs
         )
+        # Debug print to verify frequency-attention flags are propagated
+        if 'use_freq_attn' in kwargs:
+            print(f"[Diffusion_TS] kwargs.use_freq_attn={kwargs.get('use_freq_attn')}, "
+                  f"freq_heads={kwargs.get('freq_heads', kwargs.get('h_f'))}, "
+                  f"freq_d_model={kwargs.get('freq_d_model', kwargs.get('d_f'))}, "
+                  f"freq_dropout={kwargs.get('freq_dropout')}")
+        else:
+            print("[Diffusion_TS] No 'use_freq_attn' found in kwargs (model.params).")
 
         # ========== β 调度策略 ==========
         if beta_schedule == 'linear':

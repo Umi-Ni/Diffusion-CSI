@@ -374,7 +374,11 @@ class Transformer(nn.Module):
                                    padding_mode='circular', bias=False)
 
         # frequency-attention related args (from model params / kwargs)
-        self.use_freq_attn = bool(kwargs.get('use_freq_attn', False))
+        _ufa_raw = kwargs.get('use_freq_attn', False)
+        if isinstance(_ufa_raw, str):
+            self.use_freq_attn = _ufa_raw.strip().lower() in ("true", "1", "yes", "on")
+        else:
+            self.use_freq_attn = bool(_ufa_raw)
         freq_heads = int(kwargs.get('freq_heads', kwargs.get('h_f', 4)))
         freq_head_dim = int(kwargs.get('freq_d_model', kwargs.get('d_f', 16)))
         freq_pdrop = float(kwargs.get('freq_dropout', 0.1))
