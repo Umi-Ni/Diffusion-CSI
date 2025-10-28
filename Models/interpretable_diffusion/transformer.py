@@ -379,7 +379,7 @@ class Transformer(nn.Module):
         freq_head_dim = int(kwargs.get('freq_d_model', kwargs.get('d_f', 16)))
         freq_pdrop = float(kwargs.get('freq_dropout', 0.1))
 
-        # Encoder / Decoder: pass frequency-attn params through to blocks
+    # Encoder / Decoder: pass frequency-attn params through to blocks
         self.encoder = Encoder(n_layer_enc, n_embd, n_heads, attn_pdrop, resid_pdrop, mlp_hidden_times, block_activate,
                                use_freq_attn=self.use_freq_attn, freq_size=n_feat,
                                freq_heads=freq_heads, freq_head_dim=freq_head_dim,
@@ -392,6 +392,12 @@ class Transformer(nn.Module):
                                freq_heads=freq_heads, freq_head_dim=freq_head_dim,
                                freq_pdrop=freq_pdrop, freq_resid_pdrop=freq_pdrop)
         self.pos_dec = LearnablePositionalEncoding(n_embd, dropout=resid_pdrop, max_len=max_len)
+
+        # 便捷调试输出：在日志中明确频域注意力是否启用及其关键参数
+        if self.use_freq_attn:
+            print(f"[Transformer] Frequency-attention ENABLED: freq_heads={freq_heads}, head_dim={freq_head_dim}, F={n_feat}")
+        else:
+            print("[Transformer] Frequency-attention DISABLED")
 
     def forward(self, input, t, padding_masks=None, return_res=False):
         emb = self.emb(input)            # (B, C_in, L) -> (B, T, C) 经 Conv_MLP 到嵌入空间
