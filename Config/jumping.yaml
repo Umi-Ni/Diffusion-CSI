@@ -20,17 +20,17 @@ model:
     corr_weight: 0.05   # lower correlation regularization when freq-attn is enabled
     # Frequency attention settings (方案B)
     use_freq_attn: true
-    freq_heads: 4    # h_f
+    freq_heads: 2    # h_f
     freq_d_model: 16 # d_f (per-head dimension)
     freq_dropout: 0.1
     # Reduce activation memory: enable gradient checkpointing for blocks
-    activation_checkpointing: true
+    activation_checkpointing: False
 
 solver:
   base_lr: 1.0e-5
   max_epochs: 20000
   results_folder: ./Result/Checkpoints_jumping
-  gradient_accumulate_every: 2
+  gradient_accumulate_every: 4
   save_cycle: 800
   ema:
     decay: 0.995
@@ -82,6 +82,6 @@ dataloader:
     step_size: 5.0e-2
     sampling_steps: 250
 
-  batch_size: 64
+  batch_size: 32
   sample_size: 512
   shuffle: True

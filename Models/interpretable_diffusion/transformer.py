@@ -148,9 +148,14 @@ class Encoder(nn.Module):
         x = input  # (B, T, C)
         for block_idx in range(len(self.blocks)):
             if self.use_checkpoint:
-                def _fn(x_in):
-                    return self.blocks[block_idx](x_in, t, mask=padding_masks, label_emb=label_emb)
-                x, _ = checkpoint(_fn, x)
+                def _fn(x_in, t_in, mask_in):
+                    # return only x tensor to reduce checkpoint complexity
+                    out_x, _ = self.blocks[block_idx](x_in, t_in, mask=mask_in, label_emb=label_emb)
+                    return out_x
+                try:
+                    x = checkpoint(_fn, x, t, padding_masks, use_reentrant=False)
+                except TypeError:
+                    x = checkpoint(_fn, x, t, padding_masks)
             else:
                 x, _ = self.blocks[block_idx](x, t, mask=padding_masks, label_emb=label_emb)
         return x
@@ -330,9 +335,14 @@ class Decoder(nn.Module):
         trend = torch.zeros((b, c, self.n_feat), device=x.device)    # (B,C,n_feat)
         for block_idx in range(len(self.blocks)):
             if self.use_checkpoint:
-                def _fn(x_in):
-                    return self.blocks[block_idx](x_in, enc, t, mask=padding_masks, label_emb=label_emb)
-                x, residual_mean, residual_trend, residual_season = checkpoint(_fn, x)
+                def _fn(x_in, enc_in, t_in, mask_in):
+                    return self.blocks[block_idx](x_in, enc_in, t_in, mask=mask_in, label_emb=label_emb)
+                try:
+                    x, residual_mean, residual_trend, residual_season = \
+                        checkpoint(_fn, x, enc, t, padding_masks, use_reentrant=False)
+                except TypeError:
+                    x, residual_mean, residual_trend, residual_season = \
+                        checkpoint(_fn, x, enc, t, padding_masks)
             else:
                 x, residual_mean, residual_trend, residual_season = \
                     self.blocks[block_idx](x, enc, t, mask=padding_masks, label_emb=label_emb)
