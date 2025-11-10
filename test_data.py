@@ -13,10 +13,9 @@ def random_choice(size, num_select=100):
     return select_idx
 
 iterations = 5
-model_name = "wavinghand"
-version = "v1"
+model_name = "jumping"
 ori_data = np.load(f'./OUTPUT/{model_name}/samples/{model_name}_norm_truth_500_train.npy')
-csv_path = f"./Record/record_{model_name}_{version}.csv"
+csv_path = f"./Record/record_{model_name}.csv"
 
 # Write header to CSV
 with open(csv_path, 'w') as f:
